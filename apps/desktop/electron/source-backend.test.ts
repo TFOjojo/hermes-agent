@@ -197,10 +197,10 @@ test.skipIf(process.platform === 'win32')(
       }
 
       fs.unlinkSync(fixture.launcher)
-      assert.equal(
-        await resolveSourceInstallationBackend(fixture.root, serveBackendArgs(), { hermesHome: env.HERMES_HOME, env }),
-        null,
-        'a missing PM command must not fall back to the stale venv'
+      await assert.rejects(
+        resolveSourceInstallationBackend(fixture.root, serveBackendArgs(), { hermesHome: env.HERMES_HOME, env }),
+        { code: 'installed_runtime_unavailable', stage: 'launcher-missing' },
+        'a missing PM command must report the damaged installation, not offer a new install or a stale venv'
       )
     } finally {
       fs.rmSync(temp, { recursive: true, force: true })

@@ -574,6 +574,29 @@ class RelaunchExit(SystemExit):
     relaunched = True
 
 
+def _owns_console() -> bool:
+    """Whether the relaunched child needs console suppression (always on Windows).
+
+    History: 2026-10-11 added a detect-then-suppress gate here after observing
+    that CREATE_NO_WINDOW + *inherited redirected stdio* discards child output.
+    That is a real combination, but this call site never hits it: the child is
+    the managed interpreter re-entering the same command, and when the parent
+    has no console (pipes, files, windowless pythonw — the daemon topology)
+    the flag is what stops Windows from allocating a *new visible* console
+    for the child. Isolated A/B (2026-10-12, task pythonw parent with file
+    stdio): flags=0 produced a visible PseudoConsoleWindow owned by the child
+    (FLASH), CREATE_NO_WINDOW produced hwnd=0 (clean), output preserved both
+    ways with explicit file/pipe stdio.
+
+    So: unconditional. The known-lethal shape is INHERITED redirected stdio
+    under CREATE_NO_WINDOW; this call passes no stdio args at all, which
+    inherits — and that is what the detective comment confused. We keep the
+    flag AND pass the parent's stdio through explicitly so redirection is
+    never dropped.
+    """
+    return os.name == "nt"
+
+
 from pm.environments import activate_dependencies, install_state_permission_message
 from hermes_cli._early_recovery import recover_if_needed
 
@@ -595,7 +618,26 @@ if not _pm_repair:
             if os.name == "nt":
                 import subprocess
 
-                raise RelaunchExit(subprocess.call(_command))
+                # Keep the re-exec windowless: the parent may be a GUI-subsystem
+                # process (pythonw.exe) or already carry CREATE_NO_WINDOW; without
+                # this flag the relaunch interpreter allocates its own visible
+                # console and flashes a black window (2026-09-26 popup incident).
+                #
+                # 2026-10-12: UNCONDITIONAL again (the 2026-10-11 detect-then-
+                # suppress gate was wrong — see _owns_console docstring). The
+                # child's stdio is passed through explicitly: with explicit
+                # file/pipe stdio, CREATE_NO_WINDOW preserves every byte (the
+                # measured output-loss shape was INHERITED redirected stdio,
+                # which this call never produces).
+                _flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                raise RelaunchExit(subprocess.call(
+                    _command,
+                    stdin=sys.stdin,
+                    stdout=sys.stdout,
+                    stderr=sys.stderr,
+                    close_fds=True,
+                    creationflags=_flags,
+                ))
             os.execv(str(_launch_python), _command)
     except Exception as exc:
         if isinstance(exc, PermissionError) and (message := install_state_permission_message(_root, exc)):

@@ -3779,6 +3779,7 @@ export const jaOverrides = {
     modelSwitchConfirmTitle: (model: string) => `${model} に切り替えますか？`,
     modelSwitchConfirmTitleFallback: 'モデルを切り替えますか？',
     modelSwitchFailed: 'モデルの切り替えに失敗しました',
+    modelSwitchBusy: '現在の応答はまだ実行中です。モデルは変更されていません。応答が完了してから選び直してください。',
     modelSwitchKeepLabel: '現在のモデルを維持',
     modelSwitchStaleNotice: '選択が変更されたため、モデルの切り替えは適用されませんでした。',
     hydrationSyncing: (profile: string) => `${profile} を同期中\u2026`,

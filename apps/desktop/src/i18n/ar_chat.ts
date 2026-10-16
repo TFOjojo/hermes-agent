@@ -445,6 +445,7 @@ export const arChat = {
     modelSwitchConfirmTitle: (model: string) => `التبديل إلى ${model}؟`,
     modelSwitchConfirmTitleFallback: 'تبديل النموذج؟',
     modelSwitchFailed: 'فشل تبديل النموذج',
+    modelSwitchBusy: 'لا تزال الإجابة الحالية قيد التنفيذ. لم يتغير النموذج؛ حاول مجدداً بعد انتهائها.',
     modelSwitchKeepLabel: 'الاحتفاظ بالنموذج الحالي',
     modelSwitchStaleNotice: 'تغيّر الاختيار — لم يتم تطبيق تبديل النموذج.',
     hydrationSyncing: (profile: string) => `جارٍ مزامنة ${profile}\u2026`,

@@ -1,0 +1,5 @@
+name: comfyui
+version: 1.0.0
+description: "Local ComfyUI MiniMax H3 video generation backend. Requires a running ComfyUI server; base URL from video_gen.base_url, COMFYUI_URL env, or http://127.0.0.1:8188."
+author: 千花
+kind: backend

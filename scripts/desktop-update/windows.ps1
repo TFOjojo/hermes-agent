@@ -89,7 +89,7 @@ if ($PSBoundParameters.ContainsKey("Branch") -and $PSBoundParameters.ContainsKey
 }
 $targetArgs = if ($Channel) { @("--channel", $Channel.ToLowerInvariant()) } else { @("--branch", $Branch) }
 
-if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker -and -not $InstallRoot) {
     # Mandatory in spirit; relaxed in the signature only so the self-test
     # switches can drive the UI / the pipe drain without a checkout.
     throw "-InstallRoot is required"
@@ -133,7 +133,7 @@ if ($DesktopPid -gt 0) {
     $script:DesktopSeenAlive = $desktopProbe.Alive
     $script:DesktopCt = $desktopProbe.Ct
 }
-if (-not $SelfTestUi -and -not $SelfTestPipeDrain) {
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestMarker) {
     $script:MarkerClaim = Invoke-MarkerClaim
 }
 
@@ -1637,6 +1637,41 @@ try {
     $script:Committed = $true
     $finalCode = 0
     $finalMsg = "Update complete."
+    # -- 4. Restore durable local integrations before claiming success -------
+    # The Python update can exit 0 after replacing the checkout while durable
+    # integrations are still absent. Treat the restore contract as part of the
+    # Desktop update acceptance gate.
+    $integrationFailed = $false
+    $restoreScript = Join-Path $HermesHome (Join-Path "integration" "restore_after_update.py")
+    if ($res.Code -eq 0) {
+        if (-not (Test-Path -LiteralPath $restoreScript)) {
+            $integrationFailed = $true
+            Write-HandoffLog "durable integration restore script is missing: $restoreScript"
+        } else {
+            Publish-UiProgress "Restoring Hermes integrations"
+            $restore = Invoke-HermesStep $pythonExe @($restoreScript) "restore"
+            Write-HandoffLog "integration restore exit code: $($restore.Code)"
+            if ($restore.Code -ne 0) {
+                $integrationFailed = $true
+            } else {
+                $verify = Invoke-HermesStep $pythonExe @($restoreScript, "--verify-only") "restore-verify"
+                Write-HandoffLog "integration verify exit code: $($verify.Code)"
+                if ($verify.Code -ne 0) {
+                    $integrationFailed = $true
+                }
+            }
+        }
+    }
+    # -- 5. Truthful completion: don't trust exit 0 -------------------------
+    # `hermes update` treats a Desktop GUI build failure as NON-fatal (prints
+    # a one-line warning, exits 0). For a Desktop-DRIVEN update that warning
+    # is fatal: we would relaunch the old exe and call it success. Detect it,
+    # along with an integration restore that did not pass, and refuse to
+    # claim success.
+    if ($integrationFailed) {
+        $finalCode = 7
+        $finalMsg = "Code updated, but durable Hermes integrations failed to restore. The Desktop was not accepted as updated. See integration\last-restore-report.json."
+    }
     if ($script:UpdateInterrupted) {
         Add-Followup "post-update steps (gateway resume) were interrupted; run hermes update again" "its post-update steps (gateway resume) were interrupted. Run 'hermes update' again to finish them." -Manual
     }
@@ -1687,6 +1722,32 @@ try {
     if ($owedSteps.Count -gt 0) {
         $owedHint = if ($owedSteps -contains 'gateway_restart') { " Run 'hermes gateway restart' to move the messaging gateway onto the new code now." } else { '' }
         Add-Followup ("followup: owed by the committed update: " + ($owedSteps -join ', ')) ("some follow-up steps did not finish (" + ($owedSteps -join ', ') + "). The next launch or 'hermes update' retries them; the update log has the details." + $owedHint) -Manual
+    }
+
+    # -- 4. Restore durable local integrations before claiming success -------
+    # The Python update can exit 0 after replacing the checkout while durable
+    # integrations are still absent. Treat the restore contract as part of the
+    # Desktop update acceptance gate.
+    $integrationFailed = $false
+    $restoreScript = Join-Path $HermesHome (Join-Path "integration" "restore_after_update.py")
+    if ($res.Code -eq 0) {
+        if (-not (Test-Path -LiteralPath $restoreScript)) {
+            $integrationFailed = $true
+            Write-HandoffLog "durable integration restore script is missing: $restoreScript"
+        } else {
+            Publish-UiProgress "Restoring Hermes integrations"
+            $restore = Invoke-HermesStep $pythonExe @($restoreScript) "restore"
+            Write-HandoffLog "integration restore exit code: $($restore.Code)"
+            if ($restore.Code -ne 0) {
+                $integrationFailed = $true
+            } else {
+                $verify = Invoke-HermesStep $pythonExe @($restoreScript, "--verify-only") "restore-verify"
+                Write-HandoffLog "integration verify exit code: $($verify.Code)"
+                if ($verify.Code -ne 0) {
+                    $integrationFailed = $true
+                }
+            }
+        }
     }
 
     # A zero-exit update is not proof that the runtime survived the update.

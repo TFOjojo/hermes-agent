@@ -600,6 +600,12 @@ def _parent_process_handle(child_env: dict[str, str]):
             child_env["HERMES_KERNEL_PARENT_PROCESS_HANDLE"] = str(int(handle))
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.lpAttributeList = {"handle_list": [int(handle)]}
+            # 2026-10-11: belt-and-braces hiding for the console-subsystem
+            # kernel child (tools python.exe). CREATE_NO_WINDOW is also set
+            # on the Popen; STARTF_USESHOWWINDOW + SW_HIDE is added so the
+            # child has no visible window under either flag path.
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
     except (AttributeError, ImportError, OSError, TypeError, ValueError):
         if handle and close is not None:
             close(handle)
@@ -629,6 +635,11 @@ def _spawn(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     # Parent-death watchdog plumbing: Windows inherits a SYNCHRONIZE handle to this process; POSIX
     # inherits the read end of a pipe whose only write end we hold (EOF == host gone, any cause).
     parent_handle, close_handle, startupinfo = _parent_process_handle(child_env) if _IS_WINDOWS else (None, None, None)
+    if _IS_WINDOWS and startupinfo is None:
+        # Parent-handle plumbing failed open: still hide the console child.
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
     death_r: Optional[int] = None
     pass_fds: tuple[int, ...] = ()
     if not _IS_WINDOWS:

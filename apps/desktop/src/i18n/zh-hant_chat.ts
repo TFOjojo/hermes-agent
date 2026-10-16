@@ -467,6 +467,7 @@ export const zhHantChat = {
     modelSwitchConfirmTitle: (model: string) => `切換到 ${model}？`,
     modelSwitchConfirmTitleFallback: '切換模型？',
     modelSwitchFailed: '模型切換失敗',
+    modelSwitchBusy: '目前回覆仍在執行，模型尚未切換。請等本輪結束後重新點選。',
     modelSwitchKeepLabel: '保留目前模型',
     modelSwitchStaleNotice: '選擇已變更 — 未套用模型切換。',
     hydrationSyncing: (profile: string) => `正在同步 ${profile}\u2026`,

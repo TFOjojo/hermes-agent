@@ -99,11 +99,17 @@ def _resident_runtime() -> tuple[Path, Path] | None:
 
 def _validate(python: Path, env: dict[str, str]) -> str:
     try:
+        # 2026-10-15: hidden console on Windows (popup-trap captures showed this
+        # exact probe with visible=true under windowless serve trees).
+        hide = {}
+        if os.name == "nt":
+            hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         checked = subprocess.run(
             [str(python), "-I", "-B", "-c",
              "import packaging, tomli_w, truststore; from ruamel.yaml import YAML"],
             env=env, capture_output=True, text=True, timeout=30,
             check=False,
+            **hide,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return str(exc)

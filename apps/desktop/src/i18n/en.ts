@@ -5042,6 +5042,7 @@ export const en: Translations = {
     modelSwitchConfirmTitle: (model: string) => `Switch to ${model}?`,
     modelSwitchConfirmTitleFallback: 'Switch models?',
     modelSwitchFailed: 'Model switch failed',
+    modelSwitchBusy: 'The current reply is still running. The model was not changed; try again when it finishes.',
     modelSwitchKeepLabel: 'Keep current model',
     modelSwitchStaleNotice: 'Selection changed — the model switch was not applied.',
     hydrationSyncing: (profile: string) => `Syncing ${profile}\u2026`,

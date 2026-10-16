@@ -36,10 +36,17 @@ def _run(argv: list[str], cwd: str, timeout: int, env: dict) -> subprocess.Compl
     ``fetch``/``push`` could never be answered from a REST request, so fail fast and surface
     the real auth error in the toast. None when the process could not run at all."""
     try:
+        # 2026-10-15: hidden console on Windows. This runs inside windowless
+        # (pythonw) serve/gateway trees; a bare console-subsystem git child then
+        # allocates its own VISIBLE console (popup-trap captures, repeated).
+        hide = {}
+        if os.name == "nt":
+            hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         return subprocess.run(
             argv, cwd=cwd, capture_output=True, text=True, encoding='utf-8',
             errors='replace', timeout=timeout, stdin=subprocess.DEVNULL, env=env,
             check=False,
+            **hide,
         )
     except (OSError, subprocess.SubprocessError):
         return None

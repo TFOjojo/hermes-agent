@@ -907,6 +907,20 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     rid, method = req.get("id"), req.get("method")
     if not isinstance(method, str) or not method:
         return _err(rid, -32600, "invalid request: method must be a non-empty string")
+    # A bridge capability authenticates only the bridge method surface, not a
+    # full Desktop session. Enforce admission before contract validation,
+    # handler lookup or worker enqueueing; handler-local checks are insufficient.
+    from tui_gateway.methods_bridge import (
+        _bridge_credential_var, BRIDGE_CREDENTIALS, BridgeAuthError, is_bridge_method,
+    )
+    bridge_token = _bridge_credential_var.get()
+    if bridge_token:
+        try:
+            BRIDGE_CREDENTIALS.resolve(bridge_token)
+        except BridgeAuthError:
+            return _err(rid, 401, "invalid bridge credential")
+        if not is_bridge_method(method):
+            return _err(rid, 403, "bridge connection may only call bridge methods")
     params = req.get("params", {})
     if params is not None and not isinstance(params, dict):
         return _err(rid, -32602, "invalid params: expected an object")

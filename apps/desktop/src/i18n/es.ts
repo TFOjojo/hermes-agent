@@ -5575,6 +5575,7 @@ export const esOverrides = {
     modelSwitchConfirmTitle: (model: string) => `¿Cambiar a ${model}?`,
     modelSwitchConfirmTitleFallback: '¿Cambiar de modelo?',
     modelSwitchFailed: 'No se pudo cambiar de modelo',
+    modelSwitchBusy: 'La respuesta actual sigue en curso. El modelo no ha cambiado; vuelve a intentarlo cuando termine.',
     modelSwitchKeepLabel: 'Mantener el modelo actual',
     modelSwitchStaleNotice: 'La selección cambió: no se aplicó el cambio de modelo.',
     hydrationSyncing: (profile: string) => `Sincronizando ${profile}\u2026`,

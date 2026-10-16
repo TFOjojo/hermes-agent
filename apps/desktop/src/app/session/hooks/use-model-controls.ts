@@ -398,6 +398,15 @@ export function useModelControls({
 
         return true
       } catch (err) {
+        // The canonical owner explicitly refused admission: this is NOT a queued
+        // switch. Restore the real selection and let the user re-pick after idle.
+        if ((err as { data?: { reason?: string } } | null)?.data?.reason === 'session_busy') {
+          rollbackSelection()
+          notifyError(new Error(copy.modelSwitchBusy ?? copy.sessionBusy), copy.modelSwitchFailed)
+
+          return false
+        }
+
         // An OLDER gateway refuses a mid-turn switch outright (4009) instead of
         // deferring it. Don't punish the user for a backend they haven't
         // updated: keep the pick painted as the composer's selection, which is
@@ -413,7 +422,7 @@ export function useModelControls({
         return false
       }
     },
-    [cacheOwnerConnectionId, cacheProfile, copy.modelSwitchFailed, queryClient, requestGateway, updateModelOptionsCache]
+    [cacheOwnerConnectionId, cacheProfile, copy.modelSwitchBusy, copy.modelSwitchFailed, copy.sessionBusy, queryClient, requestGateway, updateModelOptionsCache]
   )
 
   return { applySavedMainModel, followDefaultModel, refreshCurrentModel, selectModel }

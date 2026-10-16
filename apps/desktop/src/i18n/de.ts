@@ -5581,6 +5581,7 @@ export const deOverrides = {
     modelSwitchConfirmTitle: (model: string) => `Zu ${model} wechseln?`,
     modelSwitchConfirmTitleFallback: 'Modell wechseln?',
     modelSwitchFailed: 'Modellwechsel fehlgeschlagen',
+    modelSwitchBusy: 'Die aktuelle Antwort läuft noch. Das Modell wurde nicht geändert. Versuche es danach erneut.',
     modelSwitchKeepLabel: 'Aktuelles Modell behalten',
     modelSwitchStaleNotice: 'Auswahl geändert – der Modellwechsel wurde nicht angewendet.',
     hydrationSyncing: (profile: string) => `Synchronisiert ${profile}…`,

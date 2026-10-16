@@ -122,12 +122,38 @@ def resolve_store_python(repo_root: Path, *, publication: bool = False) -> Path 
     for the running process (an e2e fixture, a desktop toolchain) that a later
     scratch cleanup may delete, leaving the launcher to exit 127 forever
     (#131745). It still supplies the store when the tree records none.
+
+    2026-10-12: on Windows this returns the GUI-subsystem ``pythonw.exe``
+    next to the committed ``python.exe`` when it exists. Same interpreter,
+    same ABI, same site-packages — but a console-subsystem child can never
+    allocate a visible console it was never given one to inherit (the
+    2026-10-12 Terminal-window incidents: 9118/8787/8450 backends each
+    opened a persistent Windows Terminal tab after a windowless-parent
+    relaunch). Callers needing the console interpreter (an operator's
+    interactive shell) keep working: a GUI pythonw with inherited console
+    handles still reads and writes that console. Fail-closed to the
+    console interpreter when the GUI sibling is absent.
     """
     if publication:
         own = _store_python(store_root(repo_root, honor_runtime_override=False))
         if own is not None:
-            return own
-    return _store_python(store_root(repo_root))
+            return _prefer_gui_python(own)
+    return _prefer_gui_python(_store_python(store_root(repo_root)))
+
+
+def _prefer_gui_python(python: Path | None) -> Path | None:
+    """Swap a committed console ``python.exe`` for its GUI sibling, if present."""
+    if python is None or not _is_windows():
+        return python
+    if python.name.lower() != "python.exe":
+        return python
+    sibling = python.with_name("pythonw.exe")
+    try:
+        if sibling.is_file():
+            return sibling
+    except OSError:
+        pass
+    return python
 
 
 def _store_python(runtime: Path) -> Path | None:
@@ -271,6 +297,32 @@ def mint_launcher(
                 for path in written:
                     if Path(path).suffix.lower() == ".exe":
                         return Path(path)
+                # 2026-10-12: the rewrite failed (typically WinError 32: the
+                # live hermes.exe is mapped by a running serve/gateway). If the
+                # existing launcher is FUNCTIONALLY equivalent — same embedded
+                # script, and its shebang interpreter is this install's store
+                # Python in either subsystem spelling (python.exe vs
+                # pythonw.exe differ only in console allocation) — keep it
+                # instead of failing publication. Failing here aborts the
+                # whole relaunch (prepare_launch raises InstallError), which
+                # strands every supervised backend in a crash loop.
+                try:
+                    with ZipFile(target) as old:
+                        if (old.namelist() == ["__main__.py"]
+                                and old.read("__main__.py") == script.encode("utf-8")):
+                            prefix = target.read_bytes()[:old.infolist()[0].header_offset]
+                            tail = prefix.rstrip(b"\r\n")
+                            shebangs = (f"#!{python_exe} -I\n".encode(),
+                                        f'#!"{python_exe}" -I\n'.encode())
+                            sibling = (Path(str(python_exe)).with_name(
+                                "python.exe" if Path(str(python_exe)).name.lower() == "pythonw.exe"
+                                else "pythonw.exe"))
+                            shebangs += (f"#!{sibling} -I\n".encode(),
+                                         f'#!"{sibling}" -I\n'.encode())
+                            if any(tail.endswith(s.rstrip(b"\r\n")) for s in shebangs):
+                                return target
+                except (OSError, BadZipFile, KeyError):
+                    pass
         # distlib ran but produced no exe (unexpected) — fall through to cmd.
 
     # A prepared app environment need not include distlib, even when the

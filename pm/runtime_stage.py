@@ -41,11 +41,17 @@ def stage_runtime(uv: Path, python: Path, destination: Path, *,
                              no_install_project=True, timeout=600)
         else:
             environment.install_wheelhouse(snapshot, wheelhouse, timeout=600)
+    # 2026-10-15: same hidden-console contract as pm/runtime._validate (this
+    # identical probe was captured with visible=true under a windowless tree).
+    hide = {}
+    if os.name == "nt":
+        hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     checked = subprocess.run(
         [str(environment.executable), "-I", "-B", "-c",
          "import packaging, tomli_w, truststore; from ruamel.yaml import YAML"],
         env=env, capture_output=True, text=True, timeout=30,
         check=False,
+        **hide,
     )
     if checked.returncode:
         raise InstallError("pm-runtime", f"dependency validation failed: {checked.stderr.strip()}")

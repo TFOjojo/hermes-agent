@@ -77,7 +77,14 @@ def _doctor_tool(name: str) -> tuple[str | None, str]:
 def _run_ok(cmd: list[str], timeout: int, **kw) -> bool:
     """True when *cmd* exits 0 within *timeout*; a timeout counts as failure."""
     try:
-        return subprocess.run(cmd, capture_output=True, timeout=timeout, **kw).returncode == 0  # noqa: PLW1510 -- forwarding wrapper: callers pass subprocess kwargs via **kwargs (check may arrive through it); an explicit check=False would raise TypeError
+        # 2026-10-15: hidden console on Windows — doctor runs inside windowless
+        # trees; a bare console child (docker version, ssh, ...) would allocate
+        # its own VISIBLE console (popup-trap captures).
+        import os as _os
+        hide = {}
+        if _os.name == "nt":
+            hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return subprocess.run(cmd, capture_output=True, timeout=timeout, **hide, **kw).returncode == 0  # noqa: PLW1510 -- forwarding wrapper: callers pass subprocess kwargs via **kwargs (check may arrive through it); an explicit check=False would raise TypeError
     except subprocess.TimeoutExpired:
         return False
 

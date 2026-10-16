@@ -1,0 +1,7 @@
+name: pianyitoken
+version: 1.0.0
+description: "PianyiToken 生图分组 (nano-banana via chat/completions). Requires PIANYITOKEN_IMAGE_API_KEY."
+author: 千花
+kind: backend
+requires_env:
+  - PIANYITOKEN_IMAGE_API_KEY

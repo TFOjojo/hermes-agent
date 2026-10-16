@@ -345,6 +345,51 @@ async fn run_update(app: AppHandle) -> Result<()> {
         }
     }
 
+    // ---- stage 2.5: restore durable local integrations -------------------
+    // The bootstrap updater is the desktop's real automatic-update path. It
+    // must run the same fail-closed integration restore as the manual updater
+    // before rebuilding/launching the desktop; otherwise `hermes update` can
+    // report success while durable local integrations silently disappear.
+    // (install_root is the hermes-agent checkout; the restore script lives
+    // home-side so it survives the checkout swap.)
+    let restore_script = hermes_home
+        .join("integration")
+        .join("restore_after_update.py");
+    let restore_python = install_root
+        .join("venv")
+        .join("Scripts")
+        .join("python.exe");
+    if !restore_script.is_file() {
+        let msg = format!("durable integration restore script is missing: {}", restore_script.display());
+        emit_stage(&app, "restore", StageState::Failed, Some(0), Some(msg.clone()));
+        emit(&app, BootstrapEvent::Failed { stage: Some("restore".into()), error: msg.clone() });
+        return Err(anyhow!(msg));
+    }
+    emit_stage(&app, "restore", StageState::Running, None, None);
+    let restore_started = Instant::now();
+    let restore_args = vec![restore_script.to_string_lossy().to_string()];
+    let restore = run_streamed(
+        &app,
+        &restore_python,
+        &restore_args,
+        &install_root,
+        &child_env,
+        Some("restore"),
+    )
+    .await?;
+    let restore_ms = restore_started.elapsed().as_millis() as u64;
+    if restore.exit_code != Some(0) {
+        let msg = format!(
+            "durable integration restore failed (exit {:?}). See {} for details.",
+            restore.exit_code,
+            hermes_home.join("integration").join("last-restore-report.json").display()
+        );
+        emit_stage(&app, "restore", StageState::Failed, Some(restore_ms), Some(msg.clone()));
+        emit(&app, BootstrapEvent::Failed { stage: Some("restore".into()), error: msg.clone() });
+        return Err(anyhow!(msg));
+    }
+    emit_stage(&app, "restore", StageState::Succeeded, Some(restore_ms), None);
+
     // Older updaters did not own desktop compilation. Current PM update
     // composes all products and propagates failures; never build them twice.
     if legacy_install {

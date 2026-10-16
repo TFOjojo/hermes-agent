@@ -199,6 +199,14 @@ class TestGuessCategory:
         # Even though it matches test_* pattern, logs/ is excluded.
         assert dg.guess_category(p) is None
 
+    def test_skips_integration_regression_tests(self, _isolate_env):
+        dg = _load_lib()
+        tests_dir = _isolate_env / "integration" / "tests"
+        tests_dir.mkdir(parents=True)
+        p = tests_dir / "test_dsh_health_probe.py"
+        p.write_text("def test_health(): pass")
+        assert dg.guess_category(p) is None
+
     def test_cron_subtree_categorised(self, _isolate_env):
         dg = _load_lib()
         # Only files under ``cron/output/`` are disposable run artifacts.

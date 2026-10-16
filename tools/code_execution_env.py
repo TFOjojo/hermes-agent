@@ -252,11 +252,41 @@ def _uses_hermes_python_environment(python_path: str) -> bool:
     return _python_environment_prefix(python_path) == os.path.realpath(sys.prefix)
 
 
+def _prefer_console_python(python_path: str) -> str:
+    """Swap a Windows GUI-subsystem ``pythonw.exe`` for its console sibling.
+
+    2026-10-15 (popup-trap root cause): the session kernel is spawned from a
+    windowless tree with CREATE_NO_WINDOW + SW_HIDE, so the RUNNER itself never
+    shows a window either way. But a GUI-subsystem runner owns NO console, and
+    every bare console-subsystem grandchild a cell spawns (grep/cmd/ping/git)
+    then has to allocate its OWN console — which Windows makes VISIBLE. A
+    console-subsystem runner under CREATE_NO_WINDOW owns a HIDDEN console, and
+    all of those grandchildren inherit it. Measured A/B: GUI runner ->
+    ``PseudoConsoleWindow visible=true``; console runner + CNW -> zero windows.
+
+    Same interpreter, same ABI, same site-packages; only the subsystem differs.
+    Fail-closed: return the input unchanged when the sibling is absent.
+    """
+    if not _IS_WINDOWS:
+        return python_path
+    try:
+        from pathlib import Path
+        p = Path(python_path)
+        if p.name.lower() != "pythonw.exe":
+            return python_path
+        sibling = p.with_name("python.exe")
+        if sibling.is_file():
+            return str(sibling)
+    except OSError:
+        pass
+    return python_path
+
+
 def _resolve_child_python(mode: str) -> str:
     """Child interpreter: ``sys.executable`` in strict mode; in project mode the active
     VIRTUAL_ENV/CONDA_PREFIX python if it exists and passes the 3.8+ probe, else ``sys.executable``."""
     if mode != "project":
-        return sys.executable
+        return _prefer_console_python(sys.executable)
     subdir, exe_names = ("Scripts", ("python.exe", "python3.exe")) if _IS_WINDOWS else ("bin", ("python", "python3"))
     for var in ("VIRTUAL_ENV", "CONDA_PREFIX"):
         root = os.environ.get(var, "").strip()
@@ -265,11 +295,11 @@ def _resolve_child_python(mode: str) -> str:
             if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
                 continue
             if _is_usable_python(candidate):
-                return candidate
+                return _prefer_console_python(candidate)
             logger.info("execute_code: skipping %s=%s (Python version < 3.8 or broken). "
                         "Using sys.executable instead.", var, candidate)
-            return sys.executable
-    return sys.executable
+            return _prefer_console_python(sys.executable)
+    return _prefer_console_python(sys.executable)
 
 
 def _resolve_child_cwd(mode: str, staging_dir: str, task_id: str = "") -> str:

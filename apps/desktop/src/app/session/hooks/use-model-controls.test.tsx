@@ -51,7 +51,8 @@ vi.mock('@/i18n', async importOriginal => ({
   useI18n: () => ({
     t: {
       desktop: {
-        modelSwitchFailed: 'Model switch failed'
+        modelSwitchFailed: 'Model switch failed',
+        modelSwitchBusy: 'The current reply is still running. The model was not changed; try again when it finishes.'
       }
     }
   })
@@ -428,6 +429,42 @@ describe('useModelControls', () => {
     expect($currentModel.get()).toBe('grok-4.5')
     expect($currentProvider.get()).toBe('xai')
     expect(notifyError).not.toHaveBeenCalled()
+  })
+
+  it.each(['primary', 'tile'])('reports canonical busy as not applied with an explicit retry message (%s)', async surface => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('old-primary')
+    setCurrentProvider('old-provider')
+    setCurrentReasoningEffortWire('max')
+    let tileState: Record<string, unknown> = { model: 'old-tile', provider: 'tile-provider', reasoningEffortWire: 'high' }
+    SessionStates.$sessionStates.set({ 'tile-1': tileState } as never)
+    tile.delegate = {
+      updateSession: (_id: string, update: (state: Record<string, unknown>) => Record<string, unknown>) => {
+        tileState = update(tileState)
+      }
+    }
+
+    const requestGateway = vi.fn(async () => {
+      throw Object.assign(new Error('session_busy'), { data: { reason: 'session_busy' } })
+    })
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    try {
+      await expect(result.current.selectModel({ model: 'next', provider: 'next-provider',
+        ...(surface === 'tile' ? { sessionId: 'tile-1' } : {}) })).resolves.toBe(false)
+    } finally {
+      tile.delegate = null
+    }
+
+    expect($currentModel.get()).toBe('old-primary')
+    expect($currentProvider.get()).toBe('old-provider')
+    expect($currentReasoningEffortWire.get()).toBe('max')
+    expect(tileState).toMatchObject({ model: 'old-tile', provider: 'tile-provider', reasoningEffortWire: 'high' })
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect(notifyError).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'The current reply is still running. The model was not changed; try again when it finishes.'
+    }), 'Model switch failed')
   })
 
   it('still rolls back and reports a real switch failure', async () => {

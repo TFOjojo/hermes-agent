@@ -1,0 +1,9 @@
+id: kanban-recovery-controller
+name: kanban-recovery-controller
+version: "0.1.0"
+description: "Observe-only kanban recovery controller. Records guardrail-halt and crash events in an audit ledger. Never mutates task state."
+author: "NousResearch"
+kind: standalone
+provides_hooks:
+  - on_kanban_worker_exited
+  - on_kanban_dispatch_tick

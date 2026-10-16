@@ -5590,6 +5590,7 @@ export const frOverrides = {
     modelSwitchConfirmTitle: model => `Passer à ${model} ?`,
     modelSwitchConfirmTitleFallback: 'Changer de modèle ?',
     modelSwitchFailed: 'Échec du changement de modèle',
+    modelSwitchBusy: 'La réponse est encore en cours. Le modèle reste inchangé ; réessayez une fois la réponse terminée.',
     modelSwitchKeepLabel: 'Conserver le modèle actuel',
     modelSwitchStaleNotice: "La sélection a changé — le changement de modèle n'a pas été appliqué.",
     hydrationSyncing: (profile: string) => `Synchronisation de ${profile}…`,

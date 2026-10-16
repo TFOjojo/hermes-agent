@@ -3958,6 +3958,7 @@ export const ruOverrides = {
     modelSwitchConfirmTitle: (model: string) => `Переключиться на ${model}?`,
     modelSwitchConfirmTitleFallback: 'Сменить модель?',
     modelSwitchFailed: 'Смена модели не удалась',
+    modelSwitchBusy: 'Текущий ответ ещё выполняется. Модель не изменена; повторите попытку после завершения ответа.',
     modelSwitchKeepLabel: 'Оставить текущую модель',
     modelSwitchStaleNotice: 'Выбор изменился — смена модели не применена.',
     sessionExported: 'Сеанс экспортирован',

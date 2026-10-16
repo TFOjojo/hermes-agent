@@ -113,8 +113,16 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     stopped = threading.Event()
     write_lock = threading.Lock()
     monitor = None
+    # Windows: a console-subsystem worker child of a windowless parent
+    # (desktop/serve pythonw) would otherwise allocate its own VISIBLE
+    # console (popup-trap capture 2026-10-12: pm-runtime python.exe with
+    # visible=true). CREATE_NO_WINDOW hides it; pipes still carry the
+    # protocol. No DETACHED_PROCESS (it voids the no-window bit).
+    hide = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} \
+        if sys.platform == "win32" else {}
     with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True, encoding="utf-8", env=environment) as process:
+                          text=True, encoding="utf-8", env=environment,
+                          **hide) as process:
         assert process.stdin is not None and process.stdout is not None
         writer = process.stdin
 

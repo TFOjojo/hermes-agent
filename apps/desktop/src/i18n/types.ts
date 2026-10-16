@@ -4286,6 +4286,7 @@ export interface Translations extends NoticeTranslations {
     modelSwitchConfirmTitle: (model: string) => string
     modelSwitchConfirmTitleFallback: string
     modelSwitchFailed: string
+    modelSwitchBusy?: string
     modelSwitchKeepLabel: string
     modelSwitchStaleNotice: string
     hydrationSyncing: (profile: string) => string

@@ -4760,6 +4760,7 @@ export const zhOverrides = {
     modelSwitchConfirmTitle: (model: string) => `切换到 ${model}？`,
     modelSwitchConfirmTitleFallback: '切换模型？',
     modelSwitchFailed: '模型切换失败',
+    modelSwitchBusy: '当前回复仍在执行，模型尚未切换。请等本轮结束后重新点选。',
     modelSwitchKeepLabel: '保留当前模型',
     modelSwitchStaleNotice: '选择已更改 — 未应用模型切换。',
     hydrationSyncing: (profile: string) => `正在同步 ${profile}\u2026`,

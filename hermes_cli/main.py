@@ -1274,10 +1274,17 @@ def _resolve_workspace_key() -> Optional[str]:
     neither can be determined — callers fall back to the global MRU then.
     """
     try:
+        # 2026-10-15: hidden console on Windows — runs inside windowless
+        # (pythonw) trees; a bare console-subsystem git child would allocate
+        # its own VISIBLE console (popup-trap captures).
+        _hide = {}
+        if os.name == "nt":
+            _hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
             check=False,
+            **_hide,
         )
         if result.returncode == 0 and result.stdout.strip():
             return os.path.abspath(result.stdout.strip())

@@ -1,8 +1,9 @@
 import { existsSync } from 'node:fs'
 import path from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import { buildDesktopBackendEnv } from './backend-env'
-import { execProbe, PROBE_TIMEOUT_MS } from './backend-probes'
+import { execProbe, isTimeoutError, PROBE_TIMEOUT_MS } from './backend-probes'
 import { resolveInstallationLauncher } from './updater-process'
 
 export interface SourceBackend {
@@ -20,6 +21,25 @@ export interface SourceBackend {
 interface SourceOptions {
   isWindows?: boolean
   env?: NodeJS.ProcessEnv
+  /** Set only by the user's explicit Repair install action, never by Retry. */
+  repairRequested?: boolean
+}
+
+export class InstalledRuntimeUnavailableError extends Error {
+  readonly code = 'installed_runtime_unavailable'
+  readonly stage: 'launcher-missing' | 'probe-failed'
+
+  constructor(root: string, stage: 'launcher-missing' | 'probe-failed', failure?: unknown) {
+    const value = failure && typeof failure === 'object' ? failure as { code?: unknown; signal?: unknown; killed?: boolean } : {}
+
+    const code = typeof value.code === 'number' || (typeof value.code === 'string' && /^[A-Z0-9_]+$/.test(value.code))
+      ? `; exit=${value.code}` : ''
+
+    const timeout = value.killed ? '; timeout' : ''
+    super(`Existing Hermes installation at ${root} is unavailable (${stage}${code}${timeout}). Retry startup; this is not a first-time installation. No reinstall was started.`)
+    this.name = 'InstalledRuntimeUnavailableError'
+    this.stage = stage
+  }
 }
 
 /** Keep the validated command. PM owns interpreter and generation selection. */
@@ -36,24 +56,38 @@ export async function resolveSourceInstallationBackend(
   const launcher: string | null = resolveInstallationLauncher(root, isWindows, options.hermesHome)
 
   if (!launcher) {
-    return null
+    if (options.repairRequested) {return null}
+    throw new InstalledRuntimeUnavailableError(root, 'launcher-missing')
   }
 
   const shell: boolean = isWindows && /\.(cmd|bat)$/i.test(launcher)
   const command: string = shell ? `"${launcher}"` : launcher
   const env: NodeJS.ProcessEnv = buildDesktopBackendEnv({ currentEnv: options.env ?? process.env })
 
-  try {
-    await execProbe(command, ['--version'], {
-      cwd: root,
-      env: { ...process.env, ...options.env, ...env },
-      shell,
-      stdio: 'ignore',
-      timeout: PROBE_TIMEOUT_MS,
-      windowsHide: true
-    })
-  } catch {
-    return null
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await execProbe(command, ['--version'], {
+        cwd: root,
+        env: { ...process.env, ...options.env, ...env },
+        shell,
+        stdio: 'ignore',
+        timeout: PROBE_TIMEOUT_MS,
+        windowsHide: true
+      })
+
+      break
+    } catch (error) {
+      // execProbe already retries timeouts. Retry one transient launch/non-zero
+      // failure, but never turn an existing installation into first-run setup.
+      if (attempt === 0 && !isTimeoutError(error)) {
+        await delay(250)
+
+        continue
+      }
+
+      if (options.repairRequested) {return null}
+      throw new InstalledRuntimeUnavailableError(root, 'probe-failed', error)
+    }
   }
 
   return {

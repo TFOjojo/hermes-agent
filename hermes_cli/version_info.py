@@ -12,7 +12,9 @@ Resolution order:
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,9 +62,15 @@ def _derived_version(
 
 def _run_git(repo_dir: Path, *args: str) -> str | None:
     try:
+        # 2026-10-15: hidden console on Windows (windowless tree -> a bare
+        # console-subsystem git child would allocate a VISIBLE console).
+        hide = {}
+        if sys.platform == "win32":
+            hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         result = subprocess.run(
             ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, cwd=str(repo_dir),
             check=False,
+            **hide,
         )
     except (OSError, subprocess.SubprocessError):
         return None

@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -43,12 +44,19 @@ def read_git_head(root: Path) -> str | None:
     if git is None:
         return None
     try:
+        # 2026-10-15: hidden console on Windows — boot runs inside windowless
+        # (pythonw) trees; a bare console-subsystem git child would allocate
+        # its own VISIBLE console (popup-trap captures).
+        hide = {}
+        if sys.platform == "win32":
+            hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         out = subprocess.run(
             [git, "-C", str(root), "rev-parse", "HEAD"],
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
             timeout=10,
             check=False,
+            **hide,
         )
     except (OSError, subprocess.SubprocessError):
         return None

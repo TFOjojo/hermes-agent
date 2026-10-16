@@ -33,6 +33,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import urllib.parse
 from typing import Iterator, Mapping, Optional
 
@@ -198,6 +199,13 @@ def run_git_with_credential_fallback(
     is a :func:`noninteractive_git_env`; *run_kwargs* must capture output so the refusal can be
     classified. Empty *url* means no fallback (local verbs)."""
     run_kwargs.setdefault("stdin", subprocess.DEVNULL)
+    # 2026-10-15: hidden console on Windows — plugin git verbs run under
+    # windowless backends; a bare console-subsystem git would allocate its own
+    # VISIBLE console (popup-trap captures). Hide once here; every retry below
+    # inherits it.
+    if sys.platform == "win32":
+        run_kwargs.setdefault("creationflags",
+                              getattr(subprocess, "CREATE_NO_WINDOW", 0))
     env = dict(env)
     # An inherited askpass (VS Code terminal, ksshaskpass) would swallow the remote's 401 into a
     # dialog nobody answers: the run hits its timeout instead of failing with "could not read

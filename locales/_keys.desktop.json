@@ -1436,6 +1436,7 @@
     "desktop.imagePreviewFailed",
     "desktop.imageSaved",
     "desktop.imageWriteFailed",
+    "desktop.modelSwitchBusy",
     "desktop.modelSwitchConfirmBody",
     "desktop.modelSwitchConfirmLabel",
     "desktop.modelSwitchConfirmTitle",

@@ -19,6 +19,35 @@ def _project_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _same_store_interpreter(candidate: Path, running: Path) -> bool:
+    """Whether *candidate* and *running* are the same store interpreter.
+
+    2026-10-12: resolves the python.exe/pythonw.exe sibling problem. The
+    two spell different paths but are the same install; samefile() sees
+    through that (and through '..' spellings that defeat normcase
+    compares, #122513). A venv interpreter is a different file (its own
+    sys.prefix) and still compares unequal, so boot chains re-exec once.
+    Fail-closed: any stat error falls back to the historical normcase
+    compare, which is strict (re-exec once) rather than loose.
+    """
+    try:
+        if os.path.samefile(candidate, running):
+            return True
+    except OSError:
+        pass
+    # Sibling spelling: same directory, python.exe vs pythonw.exe.
+    try:
+        if (candidate.parent == running.parent
+                and {candidate.name.lower(), running.name.lower()} == {"python.exe", "pythonw.exe"}):
+            return True
+    except OSError:
+        pass
+    try:
+        return os.path.normcase(os.path.abspath(candidate)) == os.path.normcase(os.path.abspath(running))
+    except OSError:
+        return False
+
+
 def _is_sealed(project_root: Path) -> bool:
     """A sealed tree ships its interpreter; only checkouts own a venv.
 
@@ -437,7 +466,16 @@ def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
     # normalized, so a raw compare re-execs every child forever (#122513). A
     # venv interpreter symlinked to the same binary is still a different
     # interpreter (its own sys.prefix) and must re-exec once.
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    #
+    # 2026-10-12: compare by BINARY IDENTITY, not spelling. resolve_store_python
+    # now returns the GUI-subsystem pythonw.exe sibling of the committed
+    # console python.exe (same interpreter, no visible console possible).
+    # sys.executable may spell either sibling depending on how this process
+    # was launched; os.path.samefile (with a normcase fallback for exotic
+    # filesystems) treats python.exe/pythonw.exe of the same install as the
+    # same interpreter so the relaunch converges after one hop instead of
+    # ping-ponging between siblings forever.
+    same = _same_store_interpreter(python, Path(sys.executable))
     if not current or not same:
         publish_launchers(root)
         return python
@@ -480,7 +518,7 @@ def _prepare_borrowed_launch(root: Path, owner: Path, *, current: bool) -> Path 
     python = resolve_store_python(root)
     if python is None:
         raise RuntimeError("source update has no managed Python; run `hermes pm install`")
-    same = os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable))
+    same = _same_store_interpreter(python, Path(sys.executable))
     return python if not current or not same else None
 
 
