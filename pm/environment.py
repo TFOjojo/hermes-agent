@@ -179,8 +179,15 @@ def _run_streaming(command: list[str], *, cwd: Path, env: dict[str, str],
                    timeout: int, output: TextSink) -> subprocess.CompletedProcess:
     """Keep CI progress live, a bounded diagnostic tail, and a wall-clock timeout."""
     deadline = time.monotonic() + timeout
+    # Windowless parent (pythonw) + bare console-subsystem uv child = visible
+    # console flash (popup-trap 2026-10-16: uv venv/sync visible=true under
+    # hermes.exe kanban). CREATE_NO_WINDOW hides it; pipes still carry output.
+    # No DETACHED_PROCESS (it voids the no-window bit).
+    hide = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} \
+        if sys.platform == "win32" else {}
     proc = subprocess.Popen(command, cwd=native(cwd), env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0)
+                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=0,
+                            **hide)
     pipe = proc.stdout
     assert isinstance(pipe, io.TextIOWrapper)  # Popen was given stdout=PIPE and text=True.
     tail = ""
@@ -358,8 +365,13 @@ class PythonEnvironment:
                     else:
                         tail.close(result.returncode == 0)
                     return result
+                # Same windowless-parent flash as _run_streaming: uv venv/sync/check
+                # visible=true under pythonw. Hide without detaching.
+                hide = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} \
+                    if sys.platform == "win32" else {}
                 return subprocess.run(command, cwd=native(cwd), env=env, capture_output=True,
-                                      text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False)
+                                      text=True, encoding="utf-8", errors="replace", timeout=timeout, check=False,
+                                      **hide)
             except subprocess.TimeoutExpired as exc:
                 from pm.index_config import TIMEOUT_HINT
 

@@ -233,6 +233,12 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
         status_command = ["git", "--no-optional-locks", "status", "--porcelain"]
         if not include_untracked:
             status_command.append("-uno")
+        # Windowless parent (pythonw gateway/kanban worker) + bare console-subsystem
+        # git child = visible console flash (popup-trap 2026-10-16: git status
+        # --porcelain -uno visible=true under hermes.exe kanban). Same hide as _run_git.
+        hide = {}
+        if sys.platform == "win32":
+            hide["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         dirty_result = subprocess.run(
             status_command,
             capture_output=True,
@@ -240,6 +246,7 @@ def _git_version_info(repo_dir: Path, *, include_untracked: bool = False) -> Ver
             timeout=3,
             cwd=str(repo_dir),
             check=False,
+            **hide,
         )
         dirty = dirty_result.returncode == 0 and bool((dirty_result.stdout or "").strip())
     except (OSError, subprocess.SubprocessError):

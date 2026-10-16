@@ -1112,11 +1112,16 @@ def resolve_per_model_provider_routing(model: str, models: dict | None) -> dict:
     return {}
 
 
-def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
-    """Effective reasoning config for *model*: per-model override, then global ``agent.reasoning_effort``.
+def resolve_reasoning_config(
+    cfg: dict | None, model: str = "", *, session_override: dict | None = None,
+) -> dict | None:
+    """Session selection > per-model override > global ``agent.reasoning_effort``.
 
-    Single chokepoint for every surface (CLI, gateway, TUI, cron, ``/model``, fallback activation).
+    Only an explicit session pin is passed as ``session_override``. A runtime's resolved
+    default is NOT a pin. Copy it so fallback/wire code cannot mutate session state.
     """
+    if isinstance(session_override, dict):
+        return dict(session_override)
     cfg = cfg if isinstance(cfg, dict) else {}
     agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
 

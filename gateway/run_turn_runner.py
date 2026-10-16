@@ -75,6 +75,19 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
+def _bind_session_reasoning_override(agent, runner, session_key) -> None:
+    """Carry the explicit session pin across in-agent route changes; clear on default.
+
+    Never infer a pin from the resolved model/global reasoning configuration. Rebind
+    every turn, including reused agents, so changing/clearing a selection takes effect.
+    """
+    peek = getattr(runner, "_peek_session_state", None)
+    state = peek(session_key) if callable(peek) and session_key else None
+    conversation = getattr(state, "conversation", None)
+    pin = getattr(conversation, "reasoning_override", None)
+    agent._session_reasoning_override = dict(pin) if isinstance(pin, dict) else None
+
+
 class TurnRunner:
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
@@ -1130,7 +1143,9 @@ class TurnRunner:
             session_db=getattr(runner._session_db, "_db", runner._session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
-            fallback_model=self._runner._refresh_fallback_model(),
+            fallback_model=runner._channel_fallback_model(
+                src.platform, str(src.chat_id or ""), thread_id=src.thread_id,
+                parent_id=getattr(src, "parent_chat_id", None)),
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=True,
@@ -1159,7 +1174,11 @@ class TurnRunner:
         # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
         # configured after caching must reach the next turn; per-session serialization keeps it safe.
         if found.reused and agent is not None:
-            self._runner._apply_fallback_chain_to_agent(agent, runner._refresh_fallback_model())
+            self._runner._apply_fallback_chain_to_agent(
+                agent, self._runner._channel_fallback_model(
+                    self._ctx.source.platform, str(self._ctx.source.chat_id or ""),
+                    thread_id=self._ctx.source.thread_id,
+                    parent_id=getattr(self._ctx.source, "parent_chat_id", None)))
         if found.evicted is not None:
             self._release_evicted_agent(found.evicted)
         if agent is None:
@@ -1271,6 +1290,7 @@ class TurnRunner:
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
+        _bind_session_reasoning_override(agent, runner, ctx.session_key)
         agent._voice_turn_pending = ctx.voice_turn  # auxiliary.voice_chat route
         self._merge_turn_request_overrides(agent, turn_route)
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never

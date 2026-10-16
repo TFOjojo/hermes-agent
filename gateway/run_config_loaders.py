@@ -106,6 +106,20 @@ class GatewayConfigLoadersMixin:
             return None
         return _get_channel_override(config, platform, chat_id, thread_id=thread_id, parent_id=parent_id)
 
+    def _channel_fallback_model(self, platform: Platform, chat_id: str, *, thread_id=None, parent_id=None):
+        """This channel's explicit fallback chain, else the profile-wide chain.
+
+        Only a non-empty list counts as an explicit chain. ``None``, an empty
+        list and any non-list value all fall through to the global chain: an
+        empty list would otherwise silently DISABLE fallback for that channel,
+        which is a much worse failure than ignoring a malformed entry.
+        """
+        override = self._channel_override(platform, chat_id, thread_id, parent_id)
+        chain = getattr(override, "fallback_providers", None) if override else None
+        if isinstance(chain, list) and chain:
+            return list(chain)
+        return self._refresh_fallback_model()
+
     def _resolve_model_for_channel(
         self, platform: Platform, chat_id: str, *, user_config: Optional[dict] = None,
         thread_id: Optional[str] = None, parent_id: Optional[str] = None,

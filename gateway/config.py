@@ -377,9 +377,10 @@ def persist_home_channel(home: HomeChannel, *, enabled_if_new: bool = False) -> 
 
 @dataclass
 class ChannelOverride:
-    """Per-channel model/provider/system_prompt override (``platforms.<name>.channel_overrides[channel_id]``)."""
+    """Per-channel model/provider/fallback/system_prompt override."""
     model: Optional[str] = None
     provider: Optional[str] = None
+    fallback_providers: Optional[list] = None
     system_prompt: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
