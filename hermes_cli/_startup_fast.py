@@ -67,11 +67,33 @@ def normalize_hermes_home_env() -> None:
     cwd and scaffold a full home under ``<cwd>/~/.hermes``. One expansion here gives every
     reader the same absolute spelling; ``hermes_constants`` expands as well for non-CLI
     entry points. A relative value that is not tilde/variable-shaped is left alone.
+
+    A *rooted* value with no drive and no UNC host is refused outright: Windows
+    resolves ``\\foo`` against the current directory of the current drive, so it
+    names a different home in every process. Observed live (2026-10-17) — an
+    entry that had lost its ``D:`` became ``D:\\d\\Program Files (x86)\\AI\\hermes``
+    and every launch scaffolded a fresh 1.36 GB home there. Unsetting it lets
+    every raw ``os.environ["HERMES_HOME"]`` reader fall back to the platform
+    default instead of scaffolding a home wherever the drive happens to point.
     """
     raw = os.environ.get("HERMES_HOME", "")
     if not raw.strip():
         return
     expanded = os.path.expanduser(os.path.expandvars(raw.strip()))
+    if os.name == "nt" and expanded[:1] in ("\\", "/") and not expanded.startswith(("\\\\", "//")):
+        # Cheap shape test first so the fast path imports nothing on the normal
+        # branch; the canonical predicate lives in hermes_constants.
+        from hermes_constants import _is_drive_relative_path
+
+        if _is_drive_relative_path(expanded):
+            os.environ.pop("HERMES_HOME", None)
+            sys.stderr.write(
+                f"[HERMES_HOME rejected] {expanded!r} carries no drive, so Windows "
+                f"would resolve it against whatever the current drive happens to be. "
+                f"Unsetting it; the platform default applies.\n"
+            )
+            sys.stderr.flush()
+            return
     if expanded != raw:
         os.environ["HERMES_HOME"] = expanded
 

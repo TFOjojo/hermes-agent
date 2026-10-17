@@ -14,6 +14,7 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 _profile_fallback_warned: bool = False
+_drive_relative_home_warned: bool = False
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar("_HERMES_HOME_OVERRIDE", default=_UNSET)
 
@@ -43,9 +44,56 @@ def get_hermes_home_override() -> str | None:
     return str(override) if override is not _UNSET and override else None
 
 
+def _is_drive_relative_path(value: str) -> bool:
+    r"""Is *value* rooted without a drive letter and without a UNC host?
+
+    Windows resolves ``\foo`` against the current directory of the *current*
+    drive, so one string names a different directory per process. It is never a
+    valid Hermes home. Observed live (2026-10-17): a User PATH entry that had
+    lost its ``D:`` became ``D:\d\Program Files (x86)\AI\hermes``, Hermes adopted
+    that as its home, and every launch scaffolded a fresh 1.36 GB home there
+    until ``drive_root_guard`` archived it — seven times over three weeks.
+    """
+    text = value.strip()
+    if not text or text.startswith(("\\\\", "//")):
+        return False  # empty, or UNC \\host\share
+    if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+        return False  # drive-qualified
+    return text[0] in "\\/"
+
+
+def _warn_drive_relative_home_once(path: str) -> None:
+    """Warn once that a drive-relative HERMES_HOME was refused (and what replaced it)."""
+    global _drive_relative_home_warned
+    if _drive_relative_home_warned:
+        return
+    _drive_relative_home_warned = True
+    fallback = _get_platform_default_hermes_home()
+    # Direct stderr: this runs on the earliest home resolution, often before
+    # logging exists.
+    with contextlib.suppress(Exception):
+        sys.stderr.write(
+            f"[HERMES_HOME rejected] {path!r} is rooted but carries no drive, so "
+            f"Windows would resolve it against whatever the current drive happens "
+            f"to be. Falling back to {fallback}. Pass an absolute HERMES_HOME "
+            f"(or unset it) to silence this.\n"
+        )
+        sys.stderr.flush()
+
+
 def _expand_hermes_home(path: str) -> Path:
-    """Expand environment and user-home syntax in a Hermes home path."""
-    return Path(os.path.expanduser(os.path.expandvars(path)))
+    """Expand environment and user-home syntax in a Hermes home path.
+
+    A drive-relative result is refused rather than adopted: it would name a
+    different directory in every process, and adopting one scaffolds a throwaway
+    home wherever that process's drive happened to point
+    (:func:`_is_drive_relative_path`).
+    """
+    expanded = os.path.expanduser(os.path.expandvars(path))
+    if os.name == "nt" and _is_drive_relative_path(expanded):
+        _warn_drive_relative_home_once(expanded)
+        return _get_platform_default_hermes_home()
+    return Path(expanded)
 
 
 def _get_platform_default_hermes_home() -> Path:

@@ -15,6 +15,7 @@ import json
 import os
 import shlex
 import sys
+import tempfile
 from pathlib import Path
 
 if __name__ == "__main__":
@@ -847,17 +848,40 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         return {"ok": False, "error": str(exc)}
 
 
+def _is_drive_relative_path_entry(entry: str) -> bool:
+    r"""Is *entry* rooted but carrying neither a drive letter nor a UNC host?
+
+    Windows resolves such an entry against the current directory of the current
+    drive, so one PATH string names a different directory per process. Observed
+    live (2026-10-17): an entry that had lost its ``D:`` became
+    ``\d\Program Files (x86)\AI\hermes\bin``, which the loader resolved to
+    ``D:\d\Program Files (x86)\AI\hermes\bin``; Hermes adopted that as its home
+    and scaffolded a fresh 1.36 GB home there on every launch. Never keep one,
+    never write one. (Canonical twin: ``hermes_constants._is_drive_relative_path``.)
+    """
+    text = entry.strip()
+    if not text or text.startswith(("\\\\", "//")):
+        return False  # empty, or UNC \\host\share
+    if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
+        return False  # drive-qualified
+    return text[0] in "\\/"
+
+
 def _merge_user_path(existing: str, entry: str) -> str | None:
-    """``entry`` first, or None when the PATH already names it.
+    """``entry`` first, or None when the stored PATH is already exactly right.
 
     Windows paths are case-insensitive and may carry a trailing separator, so
-    compare that way rather than by exact string.
+    compare that way rather than by exact string. Drive-relative entries are
+    dropped while we hold the value: they are unsafe to keep, and because they
+    can never match a real path they otherwise accumulate one per launch
+    (:func:`_is_drive_relative_path_entry`).
     """
     wanted = entry.rstrip("\\/")
     parts = [part for part in (existing or "").split(";") if part]
-    if any(part.rstrip("\\/").casefold() == wanted.casefold() for part in parts):
-        return None
-    return ";".join([entry, *parts])
+    kept = [part for part in parts if not _is_drive_relative_path_entry(part)]
+    present = any(part.rstrip("\\/").casefold() == wanted.casefold() for part in kept)
+    merged = ";".join(kept if present else [entry, *kept])
+    return None if merged == existing else merged
 
 
 def _register_windows_user_path(entry: Path) -> str:
@@ -895,6 +919,33 @@ def _broadcast_environment_change() -> None:
         pass
 
 
+def _is_ephemeral_home(home: Path) -> bool:
+    r"""Is *home* a throwaway home that must never be created or exposed on PATH?
+
+    Temp homes are routine — pytest's ``tmp_path``, per-task homes, CI service
+    homes — and exposure used to register whatever home it was handed, so one
+    machine's User PATH had collected 65 throwaway ``bin`` directories out of 84
+    entries. A temporary home is not a place a user command should ever resolve
+    to, and creating it makes the leak permanent, so refuse both.
+    """
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return True
+    try:
+        parts = [part.casefold() for part in Path(home).parts]
+    except (TypeError, ValueError):
+        return False
+    if any(part.startswith(("pytest-", "pytest_of")) for part in parts):
+        return True
+    if any(part in ("tmp", "temp") for part in parts):
+        return True
+    try:
+        if Path(home).resolve().is_relative_to(Path(tempfile.gettempdir()).resolve()):
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def _expose_windows_user_bin(root: Path, *, create: bool) -> dict:
     """Windows twin of expose_cli's POSIX half.
 
@@ -906,6 +957,11 @@ def _expose_windows_user_bin(root: Path, *, create: bool) -> dict:
     from hermes_constants import get_default_hermes_root
 
     directory = get_default_hermes_root() / "bin"
+    if _is_ephemeral_home(directory.parent):
+        # Nothing to repair and nothing to advertise: a throwaway home's bin dir
+        # is not a place a user command should resolve to. Creating it here is
+        # what turned a temp home into a permanent PATH entry.
+        return {"ok": True, "skipped": "ephemeral-home"}
     try:
         if not create:
             # Bootstrap: repair only commands we already own, enable nothing new.
