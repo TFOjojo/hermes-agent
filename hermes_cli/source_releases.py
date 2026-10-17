@@ -22,6 +22,23 @@ _GITHUB_ORIGIN = re.compile(
 _SHA = re.compile(r"[0-9a-f]{40}")
 
 
+def _hidden_kwargs() -> dict:
+    """Hide the child console: a windowless parent leaves it none to inherit.
+
+    A ``pythonw`` parent (gateway, kanban worker, desktop update check) has no
+    console, so a bare console-subsystem git child allocates a fresh *visible*
+    one. popup-trap captured exactly that on 2026-10-17 — ``git ls-remote
+    --tags`` and ``git merge-base --is-ancestor`` flashing six times in six
+    minutes under the release reader. ``windows_hide_flags()`` is the canonical
+    helper and is already what ``source_check._git_run`` passes for the same
+    reads; ``CREATE_NO_WINDOW`` hides the console without detaching, so pipes
+    and exit codes are unaffected.
+    """
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    return {"creationflags": windows_hide_flags()}
+
+
 def source_repository(git_cmd=None, cwd=None) -> str:
     """GitHub forks own their releases; other origins must mirror official tags."""
     if git_cmd is not None:
@@ -32,6 +49,7 @@ def source_repository(git_cmd=None, cwd=None) -> str:
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
             stdin=subprocess.DEVNULL, env=source_git_env(),
             check=False,
+            **_hidden_kwargs(),
         )
         match = _GITHUB_ORIGIN.fullmatch(result.stdout.strip())
         if result.returncode == 0 and match:
@@ -107,7 +125,8 @@ def _head_containing(git_cmd, cwd, commit: str, repository: str) -> str | None:
     def run(*args):
         return subprocess.run(
             [*git_cmd, *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=10, stdin=subprocess.DEVNULL, env=source_git_env(), check=False)
+            errors="replace", timeout=10, stdin=subprocess.DEVNULL, env=source_git_env(), check=False,
+            **_hidden_kwargs())
 
     head = run("rev-parse", "HEAD").stdout.strip()
     if not _SHA.fullmatch(head):
@@ -206,6 +225,7 @@ def _refuse_retirement_downgrade(request: dict, terminal: dict, git_cmd, cwd) ->
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
             stdin=subprocess.DEVNULL, env=source_git_env(),
             check=False,
+            **_hidden_kwargs(),
         )
         # The target need not exist locally before the updater's fetch. When it
         # does, any descendants prove that this pinned build would roll us back.
@@ -222,6 +242,7 @@ def _refuse_retirement_downgrade(request: dict, terminal: dict, git_cmd, cwd) ->
                 [*git_cmd, "rev-parse", "HEAD"], cwd=cwd, check=True,
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
                 stdin=subprocess.DEVNULL, env=source_git_env(),
+                **_hidden_kwargs(),
             ).stdout.strip()
             if installed == current["commit"] and installed != request["commit"]:
                 raise ValueError("Source retirement would downgrade the newer destination build; select the destination channel explicitly")
@@ -347,6 +368,7 @@ def _resolve_release(channel: str, git_cmd=None, cwd=None, *, repository=None,
             cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             check=True, timeout=60, stdin=subprocess.DEVNULL,
             env=source_git_env(),
+            **_hidden_kwargs(),
         )
         refs = dict((parts[1], parts[0]) for line in result.stdout.splitlines()
                     if len(parts := line.split()) == 2)
