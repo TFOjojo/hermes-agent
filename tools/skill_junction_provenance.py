@@ -240,11 +240,14 @@ def skills_root_for_path(path: Any) -> tuple[Optional[Path], Optional[str]]:
                 continue
         if relative is None:
             continue
-        if len(relative.parts) < 2:
-            # The skills root itself, or a loose file sitting directly in it.
+        if not relative.parts:
+            # The skills root itself.
             return None, None
         current = raw if raw.is_dir() else raw.parent
         while True:
+            if os.path.normcase(str(current)) == os.path.normcase(str(root_used)):
+                # Reached the root without meeting a SKILL.md: a loose file in the root.
+                return None, None
             if (current / "SKILL.md").is_file():
                 try:
                     return root, current.relative_to(root_used).as_posix()
@@ -252,8 +255,6 @@ def skills_root_for_path(path: Any) -> tuple[Optional[Path], Optional[str]]:
                     return None, None
             parent = current.parent
             if os.path.normcase(str(parent)) == os.path.normcase(str(current)):
-                return None, None
-            if os.path.normcase(str(parent)) == os.path.normcase(str(root_used)):
                 return None, None
             current = parent
     return None, None

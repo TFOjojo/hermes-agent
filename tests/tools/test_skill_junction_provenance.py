@@ -207,8 +207,19 @@ def test_skills_root_for_path_resolves_nested_skills(tmp_path, monkeypatch):
 
     assert sjp.skills_root_for_path(skill / "references" / "a.md") == (root, "devops/demo")
     assert sjp.skills_root_for_path(skill) == (root, "devops/demo")
+
+    # A top-level skill directory itself (one path segment under the root) is a skill too --
+    # passing the directory, not only a file inside it, must resolve. Regression: the
+    # "loose file at the root" guard used to swallow this case.
+    top = root / "flat"
+    (top / "references").mkdir(parents=True)
+    (top / "SKILL.md").write_text("---\nname: flat\n---\n", encoding="utf-8")
+    assert sjp.skills_root_for_path(top) == (root, "flat")
+    assert sjp.skills_root_for_path(top / "references" / "b.md") == (root, "flat")
+
     # A loose file at the root, and anything outside, is not a skill path.
     assert sjp.skills_root_for_path(root / "loose.md") == (None, None)
+    assert sjp.skills_root_for_path(root) == (None, None)
     assert sjp.skills_root_for_path(tmp_path / "elsewhere.md") == (None, None)
 
 
