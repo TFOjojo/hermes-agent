@@ -745,6 +745,13 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
     with suppress(Exception):
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
+    # Keep the linked-skill provenance snapshot in step with this edit. Without it every
+    # deliberate change to the shared library leaves the recording stale and the weekly
+    # evolution health gate reports `provenance` forever. Content edits only: a re-pointed
+    # or newly linked skill is structural and must stay visible to that gate.
+    with suppress(Exception):
+        from tools.skill_junction_provenance import maybe_rebind
+        maybe_rebind(name, action=action)
     # Curator telemetry: only the background review fork marks a skill agent-created
     # (foreground creates belong to the user). A recoverable curator archive keeps its
     # record as STATE_ARCHIVED (`hermes curator status`/`restore`); only a hard delete forgets.
