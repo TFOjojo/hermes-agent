@@ -15,7 +15,7 @@ import re
 import stat
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from pathlib import Path
 
 from agent.file_safety import get_nt_namespace_error, get_read_block_error
@@ -50,6 +50,19 @@ _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 # Read-size guard. Model-agnostic, so characters proxy tokens: 100K chars is
 # ~25-35K tokens across typical tokenisers. Configurable: file_read_max_chars.
 _DEFAULT_MAX_READ_CHARS = 100_000
+
+
+def _rebind_linked_skill_provenance(paths) -> None:
+    """Best-effort: a direct edit inside a linked skill must not leave
+    ``skills/.junction-provenance.json`` stale, or the weekly evolution health gate reports
+    ``provenance`` forever. No-op for paths outside a skills root."""
+    with suppress(Exception):
+        from tools.skill_junction_provenance import rebind_for_path
+        for _candidate in paths:
+            if _candidate:
+                rebind_for_path(_candidate)
+
+
 def _get_max_read_chars() -> int:
     """Return ``file_read_max_chars`` from config.yaml (default on missing/invalid). No module
     cache: ``load_config_readonly`` is already mtime+path cached, and a process-lifetime slot
@@ -917,6 +930,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                     # same-task writes stay unblocked (patch_tool carries it).
                     _mark_full_write_baseline(_resolved, task_id, getattr(result, "_content_sha256", None))
                 _note_edited(task_id, [path], path_to_resolved, session_id)
+                # The literal path first: a linked skill is only reachable under the skills
+                # root before any symlink resolution.
+                _rebind_linked_skill_provenance([path, _resolved])
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
@@ -1024,6 +1040,10 @@ def patch_tool(mode: str = "replace", path: str | None = None, old_string: str |
                 _carry_full_write_baselines(task_id, _known, getattr(result, "_writes", ()), _path_to_resolved)
                 # Clear failure counters so a future miss starts a fresh count.
                 _reset_patch_failures(task_id, [_r for _r in _path_to_resolved.values() if _r])
+                _rebind_linked_skill_provenance(
+                    list(_paths_to_check)
+                    + [_path_to_entry.get(_p) or _path_to_resolved.get(_p) or _p
+                       for _p in _paths_to_check])
         # old_string-not-found hint. Failure escalation is tracked for replace
         # mode only (V4A misses are rare); the generic hint is suppressed when
         # patch_replace already attached a richer "Did you mean?" snippet.

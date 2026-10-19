@@ -182,6 +182,83 @@ def rebind_entry(
     return {**result, "status": "failed", "reason": "contended"}
 
 
+def rebind_for_path(path: Any) -> dict[str, Any]:
+    """Re-bind the snapshot entry for the linked skill that owns *path* (best-effort).
+
+    ``skill_manage`` cannot reach linked skills (``Path.rglob`` does not descend into a
+    link), so the edits that actually stale the snapshot arrive through ``write_file`` /
+    ``patch`` on a path inside the shared library. This is the hook for those.
+    """
+    try:
+        root, name = skills_root_for_path(path)
+        if root is None or name is None:
+            return {"status": "skipped", "reason": "not-a-skill-path", "path": str(path)}
+        return rebind_entry(name, skills_root=root)
+    except Exception as exc:
+        return {"status": "failed", "reason": f"{type(exc).__name__}: {exc}", "path": str(path)}
+
+
+def _skills_roots() -> list[Path]:
+    roots: list[Path] = []
+    try:
+        from agent.skill_utils import get_all_skills_dirs
+        roots.extend(Path(p) for p in get_all_skills_dirs())
+    except Exception:
+        pass
+    try:
+        roots.append(_default_skills_root())
+    except Exception:
+        pass
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for root in roots:
+        key = canonical_path(root)
+        if key and key not in seen and root.is_dir():
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def skills_root_for_path(path: Any) -> tuple[Optional[Path], Optional[str]]:
+    """``(skills_root, skill_name)`` for a path inside a skill directory, else ``(None, None)``.
+
+    The candidate is deliberately NOT resolved: a linked skill is reached through
+    ``<root>/<name>/...``, and resolving that path would report the library location instead,
+    which is not under the skills root at all (learned the hard way -- the first version used
+    ``resolve()`` and answered "not-a-skill-path" for every real linked skill).
+    """
+    raw = Path(os.path.abspath(_strip_long_path_prefix(str(path))))
+    for root in _skills_roots():
+        root_abs = Path(os.path.abspath(_strip_long_path_prefix(str(root))))
+        relative = None
+        for base in (root_abs, Path(os.path.abspath(os.path.realpath(str(root_abs))))):
+            try:
+                relative = raw.relative_to(base)
+                root_used = base
+                break
+            except ValueError:
+                continue
+        if relative is None:
+            continue
+        if len(relative.parts) < 2:
+            # The skills root itself, or a loose file sitting directly in it.
+            return None, None
+        current = raw if raw.is_dir() else raw.parent
+        while True:
+            if (current / "SKILL.md").is_file():
+                try:
+                    return root, current.relative_to(root_used).as_posix()
+                except ValueError:
+                    return None, None
+            parent = current.parent
+            if os.path.normcase(str(parent)) == os.path.normcase(str(current)):
+                return None, None
+            if os.path.normcase(str(parent)) == os.path.normcase(str(root_used)):
+                return None, None
+            current = parent
+    return None, None
+
+
 def maybe_rebind(skill_name: str, *, action: Optional[str] = None,
                  skills_root: Optional[Path] = None) -> dict[str, Any]:
     """Hook entry point: rebind for content edits, never raise."""

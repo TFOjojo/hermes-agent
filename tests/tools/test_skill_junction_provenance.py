@@ -197,6 +197,45 @@ def test_generated_artifacts_do_not_move_the_hash(tmp_path):
     assert sjp.tree_sha256(tree) == baseline
 
 
+def test_skills_root_for_path_resolves_nested_skills(tmp_path, monkeypatch):
+    """A direct write inside a skill dir must resolve to that skill (nested/category aware)."""
+    root = tmp_path / "skills"
+    skill = root / "devops" / "demo"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setattr(sjp, "_skills_roots", lambda: [root])
+
+    assert sjp.skills_root_for_path(skill / "references" / "a.md") == (root, "devops/demo")
+    assert sjp.skills_root_for_path(skill) == (root, "devops/demo")
+    # A loose file at the root, and anything outside, is not a skill path.
+    assert sjp.skills_root_for_path(root / "loose.md") == (None, None)
+    assert sjp.skills_root_for_path(tmp_path / "elsewhere.md") == (None, None)
+
+
+def test_rebind_for_path_handles_a_direct_edit(linked_skill, monkeypatch):
+    """The write_file/patch hook: a direct file edit inside a linked skill re-binds it."""
+    root, snapshot, _target, link = linked_skill
+    monkeypatch.setattr(sjp, "_skills_roots", lambda: [root])
+
+    touched = link / "references" / "note.md"
+    touched.write_text("direct edit\n", encoding="utf-8")
+
+    result = sjp.rebind_for_path(touched)
+
+    assert result["status"] == "rebound", result
+    assert _entry(snapshot)["tree_sha256"] == sjp.tree_sha256(link)
+
+
+def test_rebind_for_path_outside_a_skill_is_a_no_op(tmp_path, monkeypatch):
+    monkeypatch.setattr(sjp, "_skills_roots", lambda: [tmp_path / "skills"])
+    (tmp_path / "skills").mkdir()
+
+    result = sjp.rebind_for_path(tmp_path / "somewhere.txt")
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "not-a-skill-path"
+
+
 def test_record_success_calls_the_rebind_hook(monkeypatch):
     """The seam: every successful content mutation funnels through _record_success."""
     calls: list[tuple] = []
