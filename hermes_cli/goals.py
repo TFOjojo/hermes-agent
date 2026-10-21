@@ -1299,6 +1299,10 @@ class GoalManager(GoalAuthorizationMixin):
                 # A bootstrap-window miss is expected degradation, not an operator problem.
                 logger.debug("GoalManager: goal for %s not loaded (%s): %s", session_id, exc.kind, exc)
 
+    def refresh(self) -> None:
+        """Re-read state from the DB (another writer, e.g. a tool, moved it)."""
+        self._state = load_goal(self.session_id)
+
     # --- introspection ------------------------------------------------
 
     @property
