@@ -63,3 +63,33 @@ def test_managed_install_uses_the_committed_generation_not_the_in_tree_venv(
     assert overlay is not None, "the committed generation must supply a site-packages entry"
     assert overlay == committed / "Lib" / "site-packages"
     assert not overlay.is_relative_to(stale)
+
+
+def test_managed_install_does_not_hand_pythonw_to_cron_child(tmp_path, monkeypatch):
+    """resolve_store_python returns pythonw.exe on Windows; cron must swap to python.exe.
+
+    A pythonw parent owns no console, so a console grandchild (gh/git/cmd) allocates a
+    VISIBLE window. The cron Popen already passes CREATE_NO_WINDOW; that only hides
+    descendants when the runner itself is console-subsystem.
+    """
+    from cron import scheduler_script as sched_script
+
+    committed = _write_venv(tmp_path / "installs" / "gen" / "venv")
+    store_dir = tmp_path / "store"
+    store_dir.mkdir(parents=True)
+    (store_dir / "python.exe").write_text("", encoding="utf-8")
+    store_w = store_dir / "pythonw.exe"
+    store_w.write_text("", encoding="utf-8")
+    child = _write_venv(tmp_path / "child")
+
+    monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda _root: store_w)
+    monkeypatch.setattr("pm.environments.committed_venv", lambda _root: committed)
+
+    interpreter, env_overlay = sched_script._windows_cron_python_invocation(
+        str(child / "Scripts" / "python.exe")
+    )
+
+    assert Path(interpreter).name.lower() == "python.exe"
+    assert Path(interpreter) == store_dir / "python.exe"
+    overlay = _site_packages_in(env_overlay)
+    assert overlay == committed / "Lib" / "site-packages"

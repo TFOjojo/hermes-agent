@@ -273,10 +273,15 @@ class GatewayGoalsMixin:
         return factory(sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, run_generation: int = 0,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
-        continuation through the adapter FIFO so a simultaneous real user message takes priority."""
+        continuation through the adapter FIFO so a simultaneous real user message takes priority.
+
+        ``run_generation`` is this turn's monotonic run token: it is the round identity, so a
+        post-turn hook that fires twice for the SAME turn is billed once (one judge call, one
+        turn of budget) instead of twice.
+        """
         def _load():
             from hermes_cli.goals import GoalManager
             max_turns = self._goal_max_turns_from_config()
@@ -297,10 +302,13 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
+        # An unknown generation (a direct caller with no run token) gets no round identity and
+        # therefore no duplicate-callback protection, exactly as before.
+        round_id = f"gateway-{run_generation}" if run_generation else ""
         decision = await self._run_in_executor_with_context(
             lambda: mgr.evaluate_after_turn(
                 final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
+                active_delegations=_active_deleg, round_id=round_id,
             ),
         )
         msg = decision.get("message") or ""
@@ -321,8 +329,16 @@ class GatewayGoalsMixin:
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
+        run_generation: int = 0,
     ) -> None:
-        """Run goal and loop bookkeeping after an agent turn returns."""
+        """Run goal and loop bookkeeping after an agent turn returns.
+
+        ``run_generation`` is this turn's run token, which only the goal hook needs (it is the
+        continuation round's identity). Each hook therefore carries its OWN extra kwargs: these
+        are two different signatures in one list, so a shared call site would hand the loop hook
+        a parameter it does not accept, its TypeError would be swallowed by the per-hook guard
+        below, and an in-flight /loop tick would never be released.
+        """
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
         try:
             session_entry = await self.async_session_store.get_or_create_session(
@@ -333,12 +349,16 @@ class GatewayGoalsMixin:
             return
         # Empty interrupted/errored responses must not drive /goal, but an in-flight /loop tick
         # still needs to be released and rescheduled.
-        hooks = [("loop completion", self._post_turn_loop_completion)]
+        hooks: list[tuple[str, Any, dict[str, Any]]] = [
+            ("loop completion", self._post_turn_loop_completion, {}),
+        ]
         if final_text.strip():
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
-        for label, hook in hooks:
+            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation,
+                             {"run_generation": run_generation}))
+        for label, hook, extra in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(session_entry=session_entry, source=source, final_response=final_text,
+                           **extra)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
 

@@ -339,7 +339,20 @@ def _replay_pending(conn, rows, target_queue, now: float) -> int:
     the orphan sweep skips the row until the copy is handed back (``return_completion_offer``)."""
     home, restored = hermes_home_key(get_hermes_home()), 0
     for delegation_id, payload, completed_at, dispatched_at in rows:
-        age_basis = completed_at or dispatched_at
+        # C2 (2026-10-11): age from the LAST delivery activity, not the
+        # completion time. A row whose attempts keep failing has been alive
+        # the whole time; anchoring on completed_at dropped it after a fixed
+        # 48h from completion regardless of retries (the I09 group-A drops).
+        activity = conn.execute(
+            """SELECT MAX(COALESCE(delivered_at, 0), COALESCE(updated_at, 0),
+                        COALESCE(delivery_claimed_at, 0))
+                 FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        last_activity = max(
+            (value or 0) for value in activity
+        ) if activity else 0
+        age_basis = max(completed_at or dispatched_at or 0, last_activity)
         if age_basis and (now - age_basis) > _MAX_COMPLETION_REPLAY_AGE_S:
             conn.execute("""UPDATE async_delegations SET delivery_state='dropped',
                           delivery_claim=NULL, delivery_claimed_at=NULL,

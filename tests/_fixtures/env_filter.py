@@ -244,6 +244,13 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DINGTALK_ALLOWED_USERS",
     "FEISHU_ALLOWED_USERS",
     "WECOM_ALLOWED_USERS",
+    # Weixin runs through the same allowlist/policy path as Wecom; a live WEIXIN_* in the
+    # developer shell made authorization assertions flaky until these were blanked too.
+    "WEIXIN_ALLOWED_USERS",
+    "WEIXIN_GROUP_ALLOWED_USERS",
+    "WEIXIN_DM_POLICY",
+    "WEIXIN_GROUP_POLICY",
+    "WEIXIN_ALLOW_ALL_USERS",
     "PHOTON_ALLOWED_USERS",
     "GATEWAY_ALLOWED_USERS",
     "GATEWAY_ALLOW_ALL_USERS",

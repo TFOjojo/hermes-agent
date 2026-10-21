@@ -12,6 +12,8 @@ import time
 from agent.i18n import t
 from rich.markup import escape as _escape
 
+from hermes_cli.goals import GOAL_CONTINUATION_PREFIX
+
 
 def _fresh_start() -> str:
     """Banner line printed after /clear — resolved at call time so the active language applies."""
@@ -585,6 +587,9 @@ class CLILoopsMixin:
                 return  # barrier still holds (is_waiting() also applies the age cap)
             prompt = mgr.next_continuation_prompt()
             if prompt:
+                # The barrier lift is an automatic continuation: it needs a ticket of its own so
+                # the drain-time admission check has something to validate (W2).
+                mgr.issue_continuation_ticket("barrier_lift")
                 from cli import _DIM, _RST, _cprint
                 _cprint(f"  {_DIM}{t('cli.goal.barrier_lifted')}{_RST}")
                 self._pending_input.put(prompt)
@@ -750,3 +755,28 @@ class CLILoopsMixin:
                     self._pending_input.put(prompt)
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
+
+    def _goal_continuation_refused(self, text: str) -> bool:
+        """Layer 2 for a dequeued ``_pending_input`` item: is this a goal continuation that may
+        no longer start a turn?
+
+        Called from ``_tui_process_one_input`` — after the dequeue, before the model. Anything
+        that is not a synthetic continuation is never refused here, so a real user message is
+        untouched. Refusals are announced, never silently dropped.
+        """
+        if not isinstance(text, str) or not text.startswith(GOAL_CONTINUATION_PREFIX):
+            return False
+        try:
+            from hermes_cli.goals import goal_continuation_admitted
+            admitted, reason = goal_continuation_admitted(getattr(self, "session_id", "") or "")
+        except Exception as exc:  # health: allow BLE001 -- fail-open by design: if admission cannot be determined, let the turn run rather than wedging the session (a false refusal would drop user-visible work)
+            logging.debug("goal continuation admission failed: %s", exc)
+            return False  # cannot tell: let the turn run rather than wedge the session
+        if admitted:
+            return False
+        try:
+            from cli import _DIM, _RST, _cprint
+            _cprint(f"  {_DIM}↻ Dropped a queued goal continuation — {reason}.{_RST}")
+        except Exception as exc:  # health: allow BLE001 -- refusal announcement is best-effort UI; a console or import failure must not turn a refused turn into a started one
+            logging.debug("goal refusal announcement failed: %s", exc)
+        return True

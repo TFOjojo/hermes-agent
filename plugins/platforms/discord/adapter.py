@@ -5184,7 +5184,25 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
             return False
         if self._client.user in getattr(message, "mentions", []):
             return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        # @everyone / @here is a broadcast, not an address to one bot; only treat it as a
+        # mention when the operator opts in (family/private servers). Without it a bare
+        # "@everyone 在吗" never wakes any bot and looks like two silent assistants.
+        if getattr(message, "mention_everyone", False) and self._everyone_counts_as_mention():
+            return True
+        return False
+
+    def _everyone_counts_as_mention(self) -> bool:
+        """Whether @everyone/@here wakes this bot like a direct mention (default on).
+
+        Config: ``discord.everyone_counts_as_mention`` or env
+        ``DISCORD_EVERYONE_COUNTS_AS_MENTION``. Set false per profile to require a
+        literal ``<@bot>`` in shared/busy servers.
+        """
+        return self._extra_or_env_flag(
+            "everyone_counts_as_mention", "DISCORD_EVERYONE_COUNTS_AS_MENTION", "true", truthy=True,
+        )
 
     def _self_is_raw_mentioned(self, message: Any) -> bool:
         """True only for a literal ``<@bot>`` token: reply-pings add us to ``message.mentions``
@@ -6655,13 +6673,19 @@ def _define_discord_view_classes() -> None:
 
     class ModelPickerView(_HermesView):
         """Two-step select-menu model picker: provider dropdown → model dropdown,
-        editing the original message in place. Times out after 2 minutes."""
+        editing the original message in place.
+
+        Timeout follows ``approvals.discord_prompt_timeout`` (default 300s, like every
+        other prompt view). A shorter hardcoded window makes the picker die while the
+        user is still reading it, and a dead view answers every click with Discord's
+        bare "interaction failed" — indistinguishable from a network drop.
+        """
 
         def __init__(
             self, providers: list, current_model: str, current_provider: str, session_key: str,
             on_model_selected, allowed_user_ids: set, allowed_role_ids: Optional[set] = None,
         ):
-            super().__init__(allowed_user_ids, allowed_role_ids, timeout=120)
+            super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
             self.providers = providers
             self.current_model = current_model
             self.current_provider = current_provider
@@ -6669,6 +6693,9 @@ def _define_discord_view_classes() -> None:
             self.on_model_selected = on_model_selected
             self._selected_provider: str = ""
             self._pending_expensive_model: str = ""
+            # Select option values are capped at 100 UTF-16 units by Discord, and a truncated model
+            # id would silently switch to a different model. Options carry a short token instead.
+            self._model_option_map: dict[str, str] = {}
             self._build_provider_select()
 
         def _add_button(self, label: str, style, custom_id: str, callback) -> None:
@@ -6706,6 +6733,20 @@ def _define_discord_view_classes() -> None:
             )
             self._add_button(_t_discord("platform.discord.picker.cancel", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.red, "model_cancel", self._on_cancel)
 
+        def _model_option_value(self, chunk_idx: int, slot: int, model_id: str) -> str:
+            """Short select value for one model; the real id is resolved on selection.
+
+            Discord rejects an option value outside 1..100 UTF-16 units (50035 Invalid Form Body),
+            and cutting a model id to fit would point the picker at a different model.
+            """
+            token = f"m{chunk_idx}_{slot}"
+            self._model_option_map[token] = model_id
+            return token
+
+        def _resolve_model_option(self, value: str) -> str:
+            """Map a select value back to the model id; unknown values pass through unchanged."""
+            return self._model_option_map.get(value, value)
+
         def _build_model_select(self, provider_slug: str):
             """Model dropdown(s) for one provider.
             Select caps at 25 options and View at 5 rows (2 reserved for Back/Cancel), so models are
@@ -6726,9 +6767,9 @@ def _define_discord_view_classes() -> None:
                 options = [
                     discord.SelectOption(
                         label=_truncate_discord_component_text(model_id.split("/")[-1], _DISCORD_SELECT_FIELD_LIMIT),
-                        value=_truncate_discord_component_text(model_id, _DISCORD_SELECT_FIELD_LIMIT),
+                        value=self._model_option_value(idx, slot, model_id),
                     )
-                    for model_id in chunk
+                    for slot, model_id in enumerate(chunk)
                 ]
                 suffix = f" ({idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
                 self._add_select(
@@ -6772,16 +6813,119 @@ def _define_discord_view_classes() -> None:
             extra = f"\n*{t('platform.discord.picker.more_available', count=str(total - shown))}*" if total > shown else ""
             await self._edit(interaction, t("platform.discord.picker.select_model", provider=pname, extra=extra))
 
-        async def _switch_selected_model(self, interaction: discord.Interaction, model_id: str):
+        def _build_reasoning_select(self, model_id: str):
+            self.clear_items()
+            self._selected_model = model_id
+            options = [
+                discord.SelectOption(
+                    label="保持默认 / 不修改",
+                    # Discord requires a select option value of 1..100 units; "" is a 400.
+                    value="keep",
+                    description="沿用当前配置或模型默认设置",
+                    emoji="⚡",
+                    default=True,
+                ),
+                discord.SelectOption(
+                    label="关闭思考 (none)",
+                    value="none",
+                    description="禁用思考过程，直接输出回复",
+                    emoji="⛔",
+                ),
+                discord.SelectOption(
+                    label="低思考 (low)",
+                    value="low",
+                    description="轻度推理，响应更快",
+                    emoji="🔹",
+                ),
+                discord.SelectOption(
+                    label="中等思考 (medium)",
+                    value="medium",
+                    description="标准推理深度",
+                    emoji="🔸",
+                ),
+                discord.SelectOption(
+                    label="高思考 (high)",
+                    value="high",
+                    description="深度推理，分析更全面",
+                    emoji="🔥",
+                ),
+                discord.SelectOption(
+                    label="极高思考 (ultra)",
+                    value="ultra",
+                    description="最大推理预算 (如适用)",
+                    emoji="🚀",
+                ),
+                discord.SelectOption(
+                    label="重置为默认 (reset)",
+                    value="reset",
+                    description="清除该会话的思考强度覆盖",
+                    emoji="🔄",
+                ),
+            ]
+            self._add_select(
+                "选择思考强度 (可选)...",
+                options,
+                "model_reasoning_select",
+                self._on_reasoning_selected,
+            )
+            self._add_button(
+                "返回选模型",
+                discord.ButtonStyle.grey,
+                "model_reasoning_back",
+                self._on_reasoning_back,
+            )
+            self._add_button(
+                _t_discord("platform.discord.picker.cancel", _DISCORD_BUTTON_LABEL_LIMIT),
+                discord.ButtonStyle.red,
+                "model_reasoning_cancel",
+                self._on_cancel,
+            )
+
+        async def _show_reasoning_step(self, interaction: discord.Interaction, model_id: str):
+            self._selected_model = model_id
+            self._build_reasoning_select(model_id)
+            title = "🧠 思考强度设置"
+            desc = f"已选择模型 **{model_id}**\n请选择该模型在此会话中的思考强度（Reasoning Effort）："
+            await self._edit(interaction, desc, title=title, color=discord.Color.blue())
+
+        async def _on_reasoning_selected(self, interaction: discord.Interaction):
+            if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):
+                return
+            effort = interaction.data["values"][0] if interaction.data.get("values") else ""
+            if effort == "keep":
+                effort = ""  # "keep current" carries no override
+            await self._switch_selected_model(interaction, self._selected_model, reasoning_effort=effort)
+
+        async def _on_reasoning_back(self, interaction: discord.Interaction):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            self._build_model_select(self._selected_provider)
+            pname = self._selected_provider
+            provider = next((p for p in self.providers if p["slug"] == self._selected_provider), None)
+            if provider:
+                pname = provider.get("name") or self._selected_provider
+            total = provider.get("total_models", 0) if provider else 0
+            shown = min(len(provider.get("models", [])), _DISCORD_MODEL_SELECT_CAPACITY) if provider else 0
+            extra = f"\n*{t('platform.discord.picker.more_available', count=str(total - shown))}*" if total > shown else ""
+            await self._edit(interaction, t("platform.discord.picker.select_model", provider=pname, extra=extra))
+
+        async def _switch_selected_model(self, interaction: discord.Interaction, model_id: str, reasoning_effort: str = ""):
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):
                 return
             self.resolved = True
+            # Removing controls does not cancel discord.py's View timeout task.
+            self.stop()
             self.clear_items()
             await self._edit(
                 interaction, t("platform.discord.picker.switching", model=model_id),
                 title=t("platform.discord.picker.switching_title"), view=None)
             try:
-                result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider)
+                import inspect
+                sig = inspect.signature(self.on_model_selected)
+                if len(sig.parameters) >= 4 or "reasoning_effort" in sig.parameters:
+                    result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider, reasoning_effort)
+                else:
+                    result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider)
             except Exception as exc:
                 result_text = t("platform.discord.picker.switch_error", error=str(exc))
             await interaction.edit_original_response(
@@ -6792,13 +6936,13 @@ def _define_discord_view_classes() -> None:
         async def _on_model_selected(self, interaction: discord.Interaction):
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):
                 return
-            model_id = interaction.data["values"][0]
+            model_id = self._resolve_model_option(interaction.data["values"][0])
             warning = await self._expensive_warning_for(model_id)
             if warning is not None:
                 self._build_expensive_confirm(model_id)
                 await self._edit(interaction, warning.message, title=f"⚠ {warning.title}", color=discord.Color.red())
                 return
-            await self._switch_selected_model(interaction, model_id)
+            await self._show_reasoning_step(interaction, model_id)
 
         async def _on_expensive_confirm(self, interaction: discord.Interaction):
             if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
@@ -6806,7 +6950,8 @@ def _define_discord_view_classes() -> None:
             if not self._pending_expensive_model:
                 await interaction.response.send_message(t("platform.discord.picker.expired_toast"), ephemeral=True)
                 return
-            await self._switch_selected_model(interaction, self._pending_expensive_model)
+            model_id = self._pending_expensive_model
+            await self._show_reasoning_step(interaction, model_id)
 
         async def _on_back(self, interaction: discord.Interaction):
             if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
@@ -6827,10 +6972,14 @@ def _define_discord_view_classes() -> None:
             if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
                 return
             self.resolved = True
+            self.stop()
             self.clear_items()
             await self._edit(interaction, t("platform.discord.picker.cancelled"), color=discord.Color.greyple())
 
         async def on_timeout(self):
+            # A timeout may already be queued when a switch or cancel claims the view.
+            if self.resolved:
+                return
             self.resolved = True
             self.clear_items()
             msg = self._message
@@ -6842,19 +6991,24 @@ def _define_discord_view_classes() -> None:
                     pass
 
     class ChoicePickerView(_HermesView):
-        """Flat single-select picker for finite-choice commands (/reasoning, /fast); 2-minute timeout."""
+        """Flat single-select picker for finite-choice commands (/reasoning, /fast); configured prompt timeout."""
 
         def __init__(self, choices: list, on_choice_selected, allowed_user_ids: set, allowed_role_ids: Optional[set] = None):
-            super().__init__(allowed_user_ids, allowed_role_ids, timeout=120)
+            super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
             self.choices = list(choices)[:_DISCORD_SELECT_MAX_OPTIONS]
             self.on_choice_selected = on_choice_selected
+            # Values are sent through an index token so an empty/oversized choice value can never
+            # produce a 400 Invalid Form Body (Discord requires 1..100 UTF-16 units).
+            self._choice_value_map: dict[str, str] = {}
             options = []
-            for choice in self.choices:
+            for idx, choice in enumerate(self.choices):
                 label = str(choice.get("label") or choice.get("value") or "")
+                token = f"c{idx}"
+                self._choice_value_map[token] = str(choice.get("value") or "")
                 options.append(
                     discord.SelectOption(
                         label=_truncate_discord_component_text(label, _DISCORD_SELECT_FIELD_LIMIT),
-                        value=str(choice.get("value") or ""),
+                        value=token,
                         description=_t_discord("platform.discord.picker.current", _DISCORD_SELECT_FIELD_LIMIT) if choice.get("is_current") else None,
                     )
                 )
@@ -6872,6 +7026,7 @@ def _define_discord_view_classes() -> None:
                 return
             self.resolved = True
             value = interaction.data.get("values", [""])[0]
+            value = self._choice_value_map.get(value, value)
             try:
                 result_text = await self.on_choice_selected(str(interaction.channel_id), value)
             except Exception as exc:
@@ -7359,6 +7514,15 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
     _gate("allow_bots", "DISCORD_ALLOW_BOTS", from_platform_extra=True, lower=True)
+    # @everyone / @here as an address to this bot (family servers). Accepted from the top-level
+    # ``discord:`` block or ``platforms.discord.extra``; unseeded keys never reach config.extra.
+    everyone_mention_cfg = (
+        discord_cfg["everyone_counts_as_mention"] if "everyone_counts_as_mention" in discord_cfg
+        else platform_extra_cfg.get("everyone_counts_as_mention")
+    )
+    if everyone_mention_cfg is not None:
+        seeded_extra["everyone_counts_as_mention"] = everyone_mention_cfg
+        _env_default("DISCORD_EVERYONE_COUNTS_AS_MENTION", str(everyone_mention_cfg).lower())
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")

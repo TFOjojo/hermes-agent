@@ -19,6 +19,7 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+            "session_reasoning_override": copy.deepcopy(getattr(agent, "_session_reasoning_override", None)),
             "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
 
 
@@ -30,6 +31,7 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     # runtime restore paths below (primary_runtime may predate a session /reasoning change).
     if "reasoning_config" in snapshot:
         agent.reasoning_config = snapshot["reasoning_config"]
+    agent._session_reasoning_override = copy.deepcopy(snapshot.get("session_reasoning_override"))
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
@@ -279,6 +281,8 @@ def _expensive_model_confirm(result, current_base_url: str, current_api_key, age
 
 def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: str, snapshot):
     """Swap the live agent in place, then restart/persist/mark/announce; a failed swap aborts."""
+    pin = session.get("create_reasoning_override")
+    agent._session_reasoning_override = dict(pin) if isinstance(pin, dict) else None
     try:
         agent.switch_model(
             new_model=result.new_model, new_provider=result.target_provider, api_key=result.api_key,
@@ -397,6 +401,8 @@ def _apply_switch_reasoning(sid: str, session, agent, effort: str, *, persist_gl
         return
     if agent is not None:
         agent.reasoning_config = parsed
+        # A --once effort is pinned only on the agent; its runtime snapshot restores it.
+        agent._session_reasoning_override = dict(parsed) if not persist_global else None
     if one_turn or not isinstance(session, dict):
         return
     if persist_global:

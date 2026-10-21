@@ -163,10 +163,26 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
             {"HERMES_DISABLE_LAZY_INSTALLS": "1"})
 
 
+def _console_python_for_cron(python_exe) -> str:
+    """Cron scripts spawn console grandchildren (gh/git/cmd). ``resolve_store_python``
+    returns GUI-subsystem ``pythonw.exe`` on Windows so *daemons* do not flash, but a
+    pythonw parent owns no console: every bare console child then allocates a VISIBLE
+    one. Swap to the console sibling; the cron Popen already passes CREATE_NO_WINDOW,
+    so the runner and its descendants stay hidden. Fail-closed: keep the input when
+    the sibling is absent.
+    """
+    path = _sched.Path(python_exe)
+    if path.name.lower() != "pythonw.exe":
+        return str(path)
+    sibling = path.with_name("python.exe")
+    return str(sibling) if sibling.exists() else str(path)
+
+
 def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str]]:
     """Hidden, output-capable Python invocation for Windows cron scripts. ``pythonw.exe`` loses
     captured output; uv venv launchers can re-exec the base console python and flash a window
-    even with CREATE_NO_WINDOW, so run the base python directly with venv paths overlaid in env."""
+    even with CREATE_NO_WINDOW, so run the base python directly with venv paths overlaid in env.
+    Never hand ``pythonw.exe`` to the child (see ``_console_python_for_cron``)."""
     if sys.platform != "win32":
         return python_exe, {}
 
@@ -174,10 +190,7 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     venv_dir = interpreter.parent.parent
     env_overlay: dict[str, str] = {}
 
-    if interpreter.name.lower() == "pythonw.exe":
-        sibling = interpreter.with_name("python.exe")
-        if sibling.exists():
-            interpreter = sibling
+    interpreter = _sched.Path(_console_python_for_cron(interpreter))
 
     from hermes_cli._launchers import resolve_store_python
     from pm.environments import committed_venv, site_packages as dependency_site
@@ -191,7 +204,7 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
         # and site-packages (a bare store Python would die on its first import).
         environment = committed_venv(repo)
         if environment is not None:
-            return str(managed_python), {"PYTHONPATH": os.pathsep.join(
+            return _console_python_for_cron(managed_python), {"PYTHONPATH": os.pathsep.join(
                 [str(repo), str(dependency_site(environment))])}
 
     cfg = _read_windows_pyvenv_cfg(venv_dir)
@@ -209,7 +222,7 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
                 pythonpath_entries.append(existing_pythonpath)
             env_overlay["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
 
-    return str(interpreter), env_overlay
+    return _console_python_for_cron(interpreter), env_overlay
 
 
 def _terminate_cron_script_process(proc: subprocess.Popen) -> None:

@@ -2718,6 +2718,9 @@ def _make_agent(
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
         request_overrides=runtime.get("request_overrides"),
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
+    # Carry explicit selection provenance, not the resolved model/global default.
+    agent._session_reasoning_override = (
+        dict(reasoning_config_override) if isinstance(reasoning_config_override, dict) else None)
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)

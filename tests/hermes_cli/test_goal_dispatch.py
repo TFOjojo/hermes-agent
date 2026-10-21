@@ -80,7 +80,9 @@ def test_surface_goal_state_matches_cli(surface, command, monkeypatch):
         if state:
             from dataclasses import asdict
             state = asdict(state)
-            for key in ('created_at', 'updated_at', 'waiting_since'):
+            # Wall-clock stamps and the per-session goal identity are not parity state: the two
+            # surfaces run in separate sessions at separate instants (W1 versioned snapshots).
+            for key in ('created_at', 'updated_at', 'waiting_since', 'goal_id'):
                 state.pop(key, None)
         snapshots.append(state)
     assert snapshots[0] == snapshots[1]

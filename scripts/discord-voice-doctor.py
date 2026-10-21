@@ -133,6 +133,12 @@ def check_system_tools():
                 opus_path = ctypes.util.find_library("opus")
                 if not opus_path:
                     # Platform-specific fallback paths
+                    if sys.platform == "win32":
+                        import struct
+                        target = "x64" if struct.calcsize("P") * 8 > 32 else "x86"
+                        win_bundled = os.path.join(os.path.dirname(discord.opus.__file__), "bin", f"libopus-0.{target}.dll")
+                        if os.path.isfile(win_bundled):
+                            opus_path = win_bundled
                     candidates = [
                         "/opt/homebrew/lib/libopus.dylib",   # macOS Apple Silicon
                         "/usr/local/lib/libopus.dylib",      # macOS Intel

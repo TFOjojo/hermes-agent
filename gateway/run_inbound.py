@@ -46,12 +46,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 
-def discord_triggering_note(message_id: Any) -> str:
-    """Model-facing routing note for a Discord turn (rides the API-bound user message only)."""
-    return (
-        f"[Triggering message id: `{message_id}` — use as `message_id` for reply/react/pin "
-        f"via the discord tools.]"
-    )
+from gateway.run_inbound_discord_note import discord_triggering_note
 
 
 def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
@@ -1379,6 +1374,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             try:
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
+                    run_generation=_run_generation,
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)

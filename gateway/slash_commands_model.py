@@ -469,19 +469,21 @@ class GatewayModelCommandsMixin:
         )
         adapter = self._delivery_adapter_for(ctx.source)
         if adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
-            async def _picker_switch(model_id: str, provider_slug: str) -> str:
+            async def _picker_switch(model_id: str, provider_slug: str, reasoning_effort: str = "") -> str:
                 # The picker callback binds the raw event source (pre-normalization).
+                if reasoning_effort:
+                    ctx.reasoning_effort = reasoning_effort
                 result, error = await self._perform_model_switch(ctx, model_id, provider_slug, event.source)
                 if error is not None:
                     return error
                 return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
 
-            async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+            async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str, reasoning_effort: str = "") -> str:
                 if profile_home is None:
-                    return await _picker_switch(model_id, provider_slug)
+                    return await _picker_switch(model_id, provider_slug, reasoning_effort)
                 from gateway.run import _profile_runtime_scope
                 with _profile_runtime_scope(profile_home):
-                    return await _picker_switch(model_id, provider_slug)
+                    return await _picker_switch(model_id, provider_slug, reasoning_effort)
 
             if await self._send_model_picker(event, ctx.source, adapter, ctx.session_key, listing_kwargs, _on_model_selected):
                 return None  # Picker sent — adapter handles the response

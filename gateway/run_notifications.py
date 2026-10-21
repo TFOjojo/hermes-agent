@@ -80,6 +80,12 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 # Storage causes that clear on their own (one session's lease/compression, not the store): the
 # home-channel notice appends the operator restart tail for every OTHER cause.
 _SELF_CLEARING_STORAGE_CAUSES = frozenset({"compression", "compression_closed", "turn_lease"})
+# C1 (2026-10-11): a live-but-foreign turn lease on the delivery target is
+# contention, not failure. Releasing the claim spends one of the bounded
+# delivery attempts and the reaper retries immediately, so a parent turn that
+# is merely still finishing burned the whole 8-attempt budget in seconds
+# (the I09 group-B drops). Defer instead: pending, no attempt spent.
+_TRANSIENT_DELIVERY_ERROR_NAMES = frozenset({"SessionTurnLeaseLostError"})
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
@@ -1463,7 +1469,7 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
             return None  # Suppressed noise is terminal, not a consumed process result.
         identity = self._completion_delivery_identity(evt)
         claim = self._CompletionClaim()
-        accepted = identity_claimed = refused = False
+        accepted = identity_claimed = refused = transient = False
         try:
             claim = await self._preflight_completion_delivery(evt)
             if not claim.proceed:
@@ -1491,11 +1497,21 @@ class GatewayNotificationsMixin(GatewayNotificationOwnershipMixin):
         except WakeNotAccepted:
             refused = True
             return False
+        except Exception as exc:
+            # C1: a live-but-foreign turn lease on the target session is
+            # contention (the parent turn is still finishing), not a failed
+            # delivery. Defer without spending a delivery attempt; every other
+            # error keeps the historical release-and-retry behavior.
+            if type(exc).__name__ in _TRANSIENT_DELIVERY_ERROR_NAMES:
+                transient = True
+                logger.debug("Async completion delivery deferred (contended lease): %s", exc)
+                return False
+            raise
         finally:
             if identity_claimed and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            operation = "complete" if accepted else "defer" if refused or claim.defer else "release"
+            operation = "complete" if accepted else "defer" if (refused or transient or claim.defer) else "release"
             if claim.claim_id:
                 self._settle_durable_claim(operation, claim.delegation_id, claim.claim_id)
             for sibling, claim_id in sibling_claims:

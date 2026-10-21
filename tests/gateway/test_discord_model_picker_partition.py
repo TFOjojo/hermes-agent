@@ -95,8 +95,10 @@ def test_nous_free_models_render_across_partitioned_selects():
     view._build_model_select("nous")
 
     # The tail must render — this is the regression that was failing before
-    # multi-select partitioning.
-    rendered = [v for _label, v in _all_options(view)]
+    # multi-select partitioning. Option values are short tokens (Discord caps a
+    # value at 100 UTF-16 units, and a truncated model id would be a different
+    # model), so resolve them back to model ids before comparing.
+    rendered = [view._resolve_model_option(v) for _label, v in _all_options(view)]
     assert "tencent/hy3:free" in rendered
     assert "stepfun/step-3.7-flash:free" in rendered
     assert "poolside/laguna-s-2.1:free" in rendered

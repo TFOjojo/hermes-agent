@@ -100,6 +100,9 @@ def _plan_goal_compression_recovery(
             attempts = int(recovery_state.get("attempts", 0) or 0)
     continuation_prompt = goal_mgr.next_continuation_prompt()
     if attempts < _GOAL_COMPRESSION_RECOVERY_LIMIT and continuation_prompt:
+        # The recovery retry is an automatic continuation: it needs a ticket of its own so the
+        # drain-time admission check has something to validate (W2).
+        goal_mgr.issue_continuation_ticket("compression")
         session[_GOAL_COMPRESSION_RECOVERY_ATTEMPTS] = {
             "goal_created_at": goal_created_at, "goal": goal_text, "attempts": attempts + 1}
         return (
@@ -374,6 +377,12 @@ def _goal_followup_after_turn(
                 _emit("status.update", sid, {"kind": "goal", "text": verdict_msg})
             if decision.get("should_continue") and (
                 cont_prompt := decision.get("continuation_prompt") or ""):
+                if decision.get("ticket") is None:
+                    # The decision is the authority on whether to continue; the ticket is the
+                    # authority on whether it may STILL run. Mint one when the decision did not,
+                    # so the two can never disagree and the drain-time gate refuses a turn the
+                    # goal itself just asked for.
+                    goal_mgr.issue_continuation_ticket("auto")
                 goal_followup = cont_prompt
     except Exception as _goal_exc:
         _hook_failure("goal continuation hook", _goal_exc)
@@ -435,6 +444,33 @@ def _dispatch_followup_turn(rid, sid: str, session: dict, prompt: Any, what: str
             session["running"] = False
 
 
+def _goal_followup_refused(session: dict) -> bool:
+    """Layer 2 for a TUI goal follow-up: may it start a turn right now?
+
+    Mirrors the classic CLI's ``_goal_continuation_refused`` and the gateway's
+    ``_goal_still_active_for_session``. The follow-up was minted while the previous turn was
+    still finishing, so the goal may already have been paused, cleared or edited — in which
+    case the ticket no longer holds and no model call is made. Announces the refusal the same
+    way the judge verdict was announced.
+    """
+    sid = str(session.get("session_key") or "")
+    if not sid:
+        return False
+    try:
+        from hermes_cli.goals import goal_continuation_admitted
+        admitted, reason = goal_continuation_admitted(sid)
+    except Exception as exc:  # health: allow BLE001 -- fail-open by design: if admission cannot be determined, let the turn run rather than wedging the session (a false refusal would drop user-visible work)
+        _hook_failure("goal continuation admission", exc)
+        return False  # cannot tell: let the turn run rather than wedge the session
+    if admitted:
+        return False
+    try:
+        _emit("status.update", sid, {"kind": "goal", "text": f"↻ Dropped a queued goal continuation — {reason}."})
+    except Exception as exc:  # health: allow BLE001 -- refusal announcement is best-effort UI; a dispatch failure must not turn a refused turn into a started one
+        _hook_failure("goal refusal announcement", exc)
+    return True
+
+
 def _run_post_turn_followups(
     rid, sid: str, session: dict, result: Any, goal_followup: str | None) -> None:
     """Chain whatever should run after ``running`` was released.  Order: a mid-turn user
@@ -448,6 +484,13 @@ def _run_post_turn_followups(
     if _drain_queued_prompt(rid, sid, session):
         return
     if goal_followup:
+        # Layer 2 for the TUI: the queued follow-up is a REQUEST, so it is re-validated against
+        # freshly-read state right here. A user stop / pause / edit that landed while the turn
+        # was finishing drops it instead of starting a model call.
+        with _session_profile_runtime_scope(session):
+            refused = _goal_followup_refused(session)
+        if refused:
+            return
         with _session_turn_admission(session) as admitted:
             if not admitted or session.get("running"):
                 return  # user already sent something — their turn wins

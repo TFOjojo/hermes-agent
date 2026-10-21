@@ -3644,9 +3644,14 @@ class BasePlatformAdapter(ABC):
     @records_delivery
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
-        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        max_retries: int = 5, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
-        failures fall back to a plain-text send, exhausted retries notify the user."""
+        failures fall back to a plain-text send, exhausted retries notify the user.
+
+        Retries default to 5 (2+4+8+16+32s ≈ 62s total) so a proxy flap of 20-60s
+        does not silently drop a finished response -- observed 2026-10-20: a 25s
+        tunnel outage burned all 2 retries (6s of backoff) and the reply was lost.
+        """
         async def _send(text: str) -> SendResult:
             return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 

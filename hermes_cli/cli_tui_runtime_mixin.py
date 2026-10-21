@@ -83,6 +83,15 @@ class CLITuiRuntimeMixin:
         if not is_voice_input and self._typed_voice_stop(user_input):
             return
 
+        # Layer 2 for the classic CLI. A queued /goal continuation is only a REQUEST: the user
+        # may have paused, cleared or edited the goal while it sat in _pending_input, so the
+        # ticket is re-validated here — after the dequeue, before the model — and dropped when
+        # it no longer holds. Without this, `/goal stop` still runs the turn it was meant to
+        # cancel.
+        if (not is_voice_input and isinstance(user_input, str)
+                and self._goal_continuation_refused(user_input)):
+            return
+
         # File drops are detected before any dispatch; seeded -q prompts are literal text.
         _file_drop = _detect_file_drop(user_input) if isinstance(user_input, str) and not is_seeded_query else None
         if _file_drop:

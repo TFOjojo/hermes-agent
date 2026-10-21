@@ -179,8 +179,9 @@ class GatewayBusySessionMixin:
     @staticmethod
     def _is_goal_continuation_event(event_or_text: Any) -> bool:
         """True for synthetic /goal continuation turns (so pause/clear can spare real /queue items)."""
+        from hermes_cli.goals import GOAL_CONTINUATION_PREFIX
         text = getattr(event_or_text, "text", event_or_text) or ""
-        return str(text).startswith("[Continuing toward your standing goal]\nGoal:")
+        return str(text).startswith(f"{GOAL_CONTINUATION_PREFIX}\nGoal:")
 
     def _clear_goal_pending_continuations(self, session_key: str, adapter: Any) -> int:
         """Remove queued synthetic /goal continuations for one session; real /queue items are kept."""
@@ -200,15 +201,26 @@ class GatewayBusySessionMixin:
         return removed
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
-        """Best-effort fresh DB check before running a queued continuation."""
+        """Best-effort fresh DB check before running a queued continuation.
+
+        This is the gateway's layer-2 admission gate (``goals.goal_continuation_admitted``): a
+        queued /goal continuation is a REQUEST, not a promise, so the ticket is re-validated
+        against freshly-read persisted state right before the turn would start. A user pause,
+        clear or edit that landed while it sat in the FIFO stops it here — no model call, no
+        tool. Fails CLOSED: anything that cannot be proven admissible does not run.
+        """
         if not session_id:
             return False
         try:
-            from hermes_cli.goals import GoalManager
-            return GoalManager(session_id=session_id).is_active()
+            from hermes_cli.goals import goal_continuation_admitted
+            admitted, reason = goal_continuation_admitted(session_id)
         except Exception as exc:
-            logger.debug("goal continuation: active-state recheck failed: %s", exc)
+            logger.debug("goal continuation: admission recheck failed: %s", exc)
             return False
+        if not admitted:
+            logger.info(
+                "Discarding stale goal continuation for session %s — %s", session_id, reason)
+        return admitted
 
     def _get_max_concurrent_sessions(self) -> Optional[int]:
         """Return the configured active chat session cap, if enabled."""

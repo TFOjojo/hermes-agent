@@ -13,15 +13,23 @@ import json
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_cli import goal_admission
+from hermes_cli.goal_authorization import GoalAuthorizationMixin
+from hermes_cli.goal_gates import (
+    DEFAULT_GATE_MAX_RETRIES, DEFAULT_GATE_TIMEOUT_SECONDS, GoalGate, _gate_workspace, run_gate,
+)
+from hermes_cli.goal_kanban_loop import (
+    KANBAN_GOAL_CONTINUATION_TEMPLATE, KANBAN_GOAL_FINALIZE_TEMPLATE, run_kanban_goal_loop,
+)
 from hermes_time import safe_strftime
 
 logger = logging.getLogger(__name__)
@@ -47,14 +55,11 @@ DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
 # failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
-# on concrete evidence instead of a vibe check.
-DEFAULT_GATE_TIMEOUT_SECONDS = 300
-DEFAULT_GATE_MAX_RETRIES = 3
+# on concrete evidence instead of a vibe check. The record, its defaults and the runner live in
+# ``goal_gates.py``; only the defaults are re-imported here for ``add_gate``'s optional arguments.
 # Longest a pid/session wait barrier may hold the loop before judging resumes. Timed barriers
 # (``waiting_until``) carry their own deadline and are exempt.
 _MAX_BARRIER_WAIT_S = 30 * 60
-# Bounded tail of a failed gate's combined stdout/stderr fed back to the agent.
-_GATE_OUTPUT_TAIL_CHARS = 3000
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -109,6 +114,11 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
     "confirm. Do not declare the goal complete while any gate fails. If the "
     "gate itself is wrong or cannot pass, say so clearly and stop."
 )
+
+# The marker every synthetic /goal continuation prompt starts with. Surfaces use it to tell an
+# automatic continuation apart from a real user message — pending-continuation cleanup on
+# pause/clear, and the drain-time admission check (W2).
+GOAL_CONTINUATION_PREFIX = "[Continuing toward your standing goal]"
 
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
@@ -338,87 +348,64 @@ def _render_extra_criteria(subgoals: list[str]) -> str:
     return "\n".join(f"- Extra criterion {i}: {text}" for i, text in enumerate(subgoals, start=1))
 
 
-# ── Quality gates ─────────────────────────────────────────────────────
-
-@dataclass
-class GoalGate:
-    """A deterministic shell command that must pass before a goal can be done.
-
-    Gates run at turn boundary BEFORE the LLM judge; a failing gate short-circuits judging and its
-    bounded output becomes the continuation prompt.
-    """
-    command: str
-    timeout_seconds: int = DEFAULT_GATE_TIMEOUT_SECONDS
-    max_retries: int = DEFAULT_GATE_MAX_RETRIES
-    attempts: int = 0
-    last_exit_code: Optional[int] = None
-    last_output_tail: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Optional[dict[str, Any]]) -> GoalGate:
-        if not isinstance(data, dict):
-            return cls(command="")
-        return cls(
-            command=str(data.get("command") or ""),
-            timeout_seconds=int(data.get("timeout_seconds") or DEFAULT_GATE_TIMEOUT_SECONDS),
-            max_retries=int(data.get("max_retries") or DEFAULT_GATE_MAX_RETRIES),
-            attempts=int(data.get("attempts") or 0),
-            last_exit_code=(int(data["last_exit_code"]) if data.get("last_exit_code") is not None else None),
-            last_output_tail=str(data.get("last_output_tail") or ""),
-        )
-
-
-def _gate_workspace() -> tuple[Optional[str], Optional[str]]:
-    """``(cwd, refusal)`` for this check's gates. A multi-session backend's process directory is not
-    the session's project, so gates run in the scoped session workspace (#125369). A declared
-    workspace that is not a directory on this host (deleted, remote, container) is a refusal: a
-    relative gate run anywhere else would check a different project and could pass a failing goal,
-    and no agent turn can fix it, so the caller pauses instead of retrying.
-    No declared workspace keeps the classic resolution (TERMINAL_CWD, else the launch directory)."""
-    from agent.runtime_cwd import resolve_agent_cwd, scoped_session_cwd
-
-    declared = scoped_session_cwd()
-    if declared:
-        path = Path(declared).expanduser()
-        if path.is_dir():
-            return str(path), None
-        return None, (f"the session workspace {declared} is not a directory on this host, "
-                      "and running gates anywhere else would check a different project")
-    try:
-        return str(resolve_agent_cwd()), None
-    except OSError:
-        return None, None  # deleted launch directory: subprocess reports it per gate
-
-
-def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> tuple[bool, int, str]:
-    """Run one gate through the shell. Returns ``(passed, exit_code, output_tail)``; a timeout kills
-    the process and counts as exit code -1."""
-    try:
-        # utf-8/replace: operator-configured output is arbitrary bytes; strict codepage decoding of
-        # one unmappable byte (emoji/CJK on a non-UTF-8 Windows console) kills the reader thread and
-        # the tail the agent needs arrives empty.
-        proc = subprocess.run(
-            gate.command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=max(1, int(gate.timeout_seconds)), cwd=cwd or None,
-            check=False,
-        )
-        combined = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
-        return proc.returncode == 0, proc.returncode, combined[-_GATE_OUTPUT_TAIL_CHARS:]
-    except subprocess.TimeoutExpired as exc:
-        out = "".join(c if isinstance(c, str) else c.decode("utf-8", "replace") for c in (exc.stdout, exc.stderr) if c)
-        return False, -1, (out + f"\n[gate timed out after {gate.timeout_seconds}s]")[-_GATE_OUTPUT_TAIL_CHARS:]
-    except Exception as exc:
-        return False, -1, f"[gate could not run: {type(exc).__name__}: {exc}]"
-
 
 # ── Goal state ────────────────────────────────────────────────────────
 
+# Snapshot format version. Rows written before versioning carry no ``schema_version`` and load
+# as compatible legacy rows (fields filled in on their first authorized change); a row declaring
+# a version this build does not know is refused rather than misinterpreted (T02).
+GOAL_STATE_SCHEMA_VERSION = 1
+# A goal row in one of these states is a live goal: creating another one over it is a conflict.
+_LIVE_GOAL_STATUSES = frozenset({"active", "paused"})
+
+
+class GoalStoreError(RuntimeError):
+    """A goal persistence failure. ``kind`` classifies it — none of these means "no goal"."""
+
+    kind = "store-error"
+
+
+class GoalStoreUnavailable(GoalStoreError):
+    """The session store could not be read or written (bootstrap window, lock, I/O)."""
+
+    kind = "unavailable"
+
+
+class GoalStateCorrupt(GoalStoreError):
+    """A goal row exists but cannot be interpreted (broken JSON, unknown schema_version).
+    The original bytes are always preserved."""
+
+    kind = "corrupt"
+
+
+class GoalConflict(GoalStoreError):
+    """The stored goal moved on: it no longer matches the goal_id/revision the writer read.
+    ``current`` carries the snapshot that won, when it could still be read."""
+
+    kind = "conflict"
+
+    def __init__(self, message: str, *, current: Optional[GoalState] = None):
+        super().__init__(message)
+        self.current = current
+
+
+@dataclass(frozen=True)
+class GoalRef:
+    """Compare-and-swap handle for one persisted goal snapshot."""
+
+    goal_id: str
+    revision: int
+
+
 @dataclass
 class GoalState:
-    """Serializable goal state stored per session."""
+    """Serializable goal state stored per session.
+
+    Versioned snapshot: ``schema_version`` guards forward compatibility, ``goal_id`` names one
+    logical goal across clear/recreate, and ``revision`` is a per-goal monotonic counter —
+    together the CAS handle every mutation commits against. Rows written before versioning load
+    with ``goal_id=""`` / ``revision=0`` and gain real values on their first authorized change.
+    """
     goal: str
     status: str = "active"          # active | paused | done | cleared
     turns_used: int = 0
@@ -451,6 +438,10 @@ class GoalState:
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
     gates: list[GoalGate] = field(default_factory=list)
+    # ── Versioned snapshot (W1) ──
+    schema_version: int = GOAL_STATE_SCHEMA_VERSION
+    goal_id: str = ""                 # one logical goal; a recreated goal gets a new one
+    revision: int = 0                 # per-goal monotonic counter (CAS handle with goal_id)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -459,7 +450,7 @@ class GoalState:
     def from_json(cls, raw: str) -> GoalState:
         data = json.loads(raw)
         raw_subgoals = data.get("subgoals") or []
-        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations")}
+        ints = {k: int(data.get(k) or 0) for k in ("turns_used", "consecutive_parse_failures", "consecutive_transport_failures", "waiting_on_delegations", "revision")}
         floats = {k: float(data.get(k) or 0.0) for k in ("created_at", "last_turn_at", "waiting_until", "waiting_since")}
         return cls(
             goal=data.get("goal", ""),
@@ -477,6 +468,8 @@ class GoalState:
                 GoalGate.from_dict(g) for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            schema_version=int(data.get("schema_version") or GOAL_STATE_SCHEMA_VERSION),
+            goal_id=str(data.get("goal_id") or ""),
             **ints, **floats,
         )
 
@@ -633,77 +626,272 @@ def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
     )
 
 
-def load_goal(session_id: str) -> Optional[GoalState]:
-    """Load the goal for a session, or None if none exists."""
+def _read_meta(db, key: str) -> Optional[str]:
+    """One ``state_meta`` read; a store failure is "unavailable", never "no row"."""
+    try:
+        return db.get_meta(key)
+    except Exception as exc:
+        raise GoalStoreUnavailable(f"goal read failed for {key}: {exc}") from exc
+
+
+def _classify_row(raw: Optional[str]) -> tuple[str, Optional[GoalState]]:
+    """``(kind, state)`` for a stored goal row: ``absent`` / ``ok`` / ``corrupt``.
+
+    Never raises and never rewrites: a corrupt or unknown-schema row is reported so the caller
+    can refuse (and keep the original bytes) instead of treating it as "no goal".
+    """
+    if raw is None:
+        return "absent", None
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("goal row is not a JSON object")
+        version = data.get("schema_version", GOAL_STATE_SCHEMA_VERSION)
+        if version != GOAL_STATE_SCHEMA_VERSION:
+            raise ValueError(f"unsupported goal schema_version {version!r}")
+        return "ok", GoalState.from_json(raw)
+    except Exception as exc:  # health: allow BLE001 -- the contract of this classifier is to translate ANY parse failure into "corrupt"; catching less would let malformed rows raise out of a function documented as never raising
+        return "corrupt", GoalStateCorrupt(f"stored goal is unreadable: {exc}")
+
+
+def _read_goal_row(session_id: str) -> tuple[str, Optional[GoalState]]:
+    """Classify a session's goal row. Raises GoalStoreUnavailable when the store itself cannot
+    be read — distinct from an absent row."""
     if not session_id:
-        return None
+        return "absent", None
     db = _get_session_db()
     if db is None:
-        return None
+        raise GoalStoreUnavailable(f"session store unavailable for {session_id}")
+    return _classify_row(_read_meta(db, _meta_key(session_id)))
+
+
+def load_goal(session_id: str) -> Optional[GoalState]:
+    """Load the goal for a session; ``None`` means there is no goal ROW.
+
+    An unreadable row raises GoalStateCorrupt (never "no goal") and an unreadable store raises
+    GoalStoreUnavailable — callers that must degrade catch GoalStoreError and keep the failure
+    visible (``GoalManager.load_error``) instead of silently dropping the user's goal.
+    """
+    kind, state = _read_goal_row(session_id)
+    if kind == "corrupt":
+        raise state
+    return state
+
+
+def _new_goal_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _next_snapshot(next_state: GoalState, goal_id: str, revision: int) -> GoalState:
+    """The snapshot to persist: ``next_state``'s content under a stamped identity."""
+    return replace(
+        next_state, goal_id=goal_id, revision=revision, schema_version=GOAL_STATE_SCHEMA_VERSION,
+    )
+
+
+def _plan_commit(
+    expected: Optional[GoalRef], kind: str, current: Optional[GoalState], *, new_goal: bool,
+) -> tuple[str, int]:
+    """``(goal_id, base_revision)`` for the next snapshot of this goal.
+
+    ``expected=None`` is a create: it may only land when no LIVE goal is stored (an absent or
+    terminal row, or an unreadable one — an explicit set is the recovery path for a row this
+    build cannot interpret). A ``GoalRef`` must match the stored row exactly, which is what
+    makes every edit a compare-and-swap. ``new_goal`` is a create-or-replace: the guard still
+    applies, but the snapshot gets a fresh identity and its own revision counter, so nothing
+    holding the old reference — a cleared goal's tombstone, or a goal this set replaces — can
+    hit it.
+    """
+    if expected is None:
+        if kind == "ok" and current.status in _LIVE_GOAL_STATUSES:
+            raise GoalConflict("a live goal already exists for this session", current=current)
+        return _new_goal_id(), 0
+    if kind == "corrupt":
+        raise current
+    if kind != "ok" or (current.goal_id, current.revision) != (expected.goal_id, expected.revision):
+        raise GoalConflict(
+            f"stored goal is ({kind}, {getattr(current, 'goal_id', None)}, "
+            f"{getattr(current, 'revision', None)}), expected ({expected.goal_id}, {expected.revision})",
+            current=current,
+        )
+    if new_goal:
+        return _new_goal_id(), 0
+    # A pre-versioning row has no identity yet: its first authorized change mints one.
+    return (expected.goal_id or _new_goal_id()), current.revision
+
+
+def commit_goal(
+    session_id: str, expected: Optional[GoalRef], next_state: GoalState, *, new_goal: bool = False,
+) -> GoalState:
+    """Atomically persist ``next_state`` as the session's goal, or change nothing.
+
+    Reads the stored row, checks it against ``expected`` (see ``_plan_commit``), then writes the
+    new snapshot inside one guarded transaction: a row that moved in between loses the guard, so
+    a late judge verdict or an old client's edit can never overwrite a newer state. On success
+    ``next_state`` itself is stamped with the committed goal_id/revision (memory adopts the
+    commit, never the reverse) and returned.
+
+    Raises GoalConflict (stored goal moved on), GoalStateCorrupt (row unreadable) or
+    GoalStoreUnavailable (store read/write failed) — none of which means "no goal".
+    """
+    if not session_id:
+        raise GoalStoreUnavailable("no session id to commit a goal for")
+    db = _get_session_db()
+    if db is None:
+        raise GoalStoreUnavailable(f"session store unavailable for {session_id}")
+    key = _meta_key(session_id)
+    raw = _read_meta(db, key)
+    kind, current = _classify_row(raw)
+    goal_id, base_revision = _plan_commit(expected, kind, current, new_goal=new_goal)
+    snapshot = _next_snapshot(next_state, goal_id, base_revision + 1)
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        outcome = db.exchange_meta({key: raw}, {key: snapshot.to_json()})
     except Exception as exc:
-        logger.debug("GoalManager: get_meta failed: %s", exc)
-        return None
-    if not raw:
-        return None
-    try:
-        return GoalState.from_json(raw)
-    except Exception as exc:
-        logger.warning("GoalManager: could not parse stored goal for %s: %s", session_id, exc)
-        return None
+        raise GoalStoreUnavailable(f"goal commit failed for {session_id}: {exc}") from exc
+    if outcome != "committed":
+        try:
+            _, winner = _classify_row(_read_meta(db, key))
+        except GoalStoreError:
+            winner = None
+        raise GoalConflict("stored goal changed during commit", current=winner)
+    next_state.goal_id, next_state.revision = goal_id, base_revision + 1
+    return next_state
 
 
 def save_goal(session_id: str, state: GoalState) -> None:
-    """Persist a goal to SessionDB. No-op if DB unavailable."""
+    """Persist a goal snapshot without a compare-and-swap (seeding / legacy callers).
+
+    Stamps the version fields — a snapshot without a ``goal_id`` is a new goal and mints one —
+    and stamps ``state`` in place. Raises GoalStoreUnavailable when the store cannot be written
+    and GoalConflict when a snapshot carrying a goal_id would land over a DIFFERENT stored goal
+    (an old client's edit of a goal that has since been cleared or replaced). Production
+    mutations go through ``commit_goal``; this path stays for compatibility.
+    """
     if not session_id:
         return
     db = _get_session_db()
     if db is None:
-        _warn_dropped_write("GoalManager", "goal", session_id)
-        return
+        raise GoalStoreUnavailable(f"session store unavailable for {session_id}")
+    key = _meta_key(session_id)
+    kind, current = _classify_row(_read_meta(db, key))
+    if state.goal_id:
+        if kind == "corrupt":
+            raise current
+        if kind != "ok" or (current.goal_id, current.revision) != (state.goal_id, state.revision):
+            raise GoalConflict("stale goal snapshot cannot overwrite the stored goal", current=current)
+        goal_id, revision = state.goal_id, current.revision + 1
+    else:
+        goal_id, revision = _new_goal_id(), 1
+    snapshot = _next_snapshot(state, goal_id, revision)
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
+        db.set_meta(key, snapshot.to_json())
     except Exception as exc:
-        logger.debug("GoalManager: set_meta failed: %s", exc)
+        raise GoalStoreUnavailable(f"goal write failed for {session_id}: {exc}") from exc
+    state.goal_id, state.revision = goal_id, revision
 
 
 def clear_goal(session_id: str) -> None:
-    """Mark a goal cleared in the DB (preserved for audit, status=cleared)."""
+    """Archive the goal as a tombstone: same goal_id, new revision, status ``cleared``.
+
+    The row is kept for audit, and because a tombstone is a terminal state a later create over
+    it is allowed while a live goal is not. No-op when there is no goal row; an unreadable row
+    raises GoalStateCorrupt and keeps its bytes.
+    """
     state = load_goal(session_id)
     if state is None:
         return
-    state.status = "cleared"
-    save_goal(session_id, state)
+    commit_goal(session_id, GoalRef(state.goal_id, state.revision), replace(state, status="cleared"))
+
+
+def move_goal(
+    old_session_id: str, new_session_id: str, expected: Optional[GoalRef], *, reason: str = "",
+) -> Optional[GoalState]:
+    """Transfer the goal row to another session as ONE transaction (compression rotation).
+
+    Writes the child row and archives the parent row inside a single guarded exchange, so there
+    is no window in which the goal exists twice or nowhere. Returns the migrated snapshot, or
+    ``None`` when nothing changed: invalid ids, no live goal on the parent, a ``expected`` that
+    no longer matches, a live (or unreadable) goal already on the child, or a store failure —
+    never a half transfer. The goal keeps its ``goal_id``; the parent's tombstone moves the
+    revision on.
+    """
+    if not old_session_id or not new_session_id or old_session_id == new_session_id:
+        return None
+    db = _get_session_db()
+    if db is None:
+        raise GoalStoreUnavailable(f"session store unavailable for {old_session_id}")
+    old_key, new_key = _meta_key(old_session_id), _meta_key(new_session_id)
+    old_raw = _read_meta(db, old_key)
+    kind, parent = _classify_row(old_raw)
+    if kind != "ok" or parent.status == "cleared":
+        return None
+    if expected is not None and (parent.goal_id, parent.revision) != (expected.goal_id, expected.revision):
+        return None
+    new_raw = _read_meta(db, new_key)
+    child_kind, child = _classify_row(new_raw)
+    if child_kind == "corrupt" or (child_kind == "ok" and child.status in _LIVE_GOAL_STATUSES):
+        return None
+    migrated_id = parent.goal_id or _new_goal_id()
+    # The goal itself did not change — it moved — so it keeps its identity AND its revision; the
+    # parent's archived row is the new snapshot of that goal.
+    migrated = _next_snapshot(parent, migrated_id, parent.revision)
+    tombstone = replace(parent, goal_id=migrated_id, revision=parent.revision + 1,
+                        status="cleared", schema_version=GOAL_STATE_SCHEMA_VERSION)
+    try:
+        outcome = db.exchange_meta(
+            {old_key: old_raw, new_key: new_raw},
+            {new_key: migrated.to_json(), old_key: tombstone.to_json()},
+        )
+    except Exception as exc:
+        raise GoalStoreUnavailable(f"goal move {old_session_id} -> {new_session_id} failed: {exc}") from exc
+    if outcome != "committed":
+        return None
+    logger.debug("GoalManager: moved goal %s -> %s (%s)", old_session_id, new_session_id, reason or "rotation")
+    return migrated
 
 
 def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
-    """Carry a persistent /goal from a parent session to its continuation. Best-effort, never raises
-    (a failure here must not block compression). Returns True when a goal was migrated.
+    """Carry a persistent /goal from a parent session to its compression continuation.
 
-    Context compression rotates ``session_id`` to a fresh child session, but ``load_goal`` does a flat
-    ``goal:<session_id>`` lookup with no parent-lineage walk — so an active goal silently dies at the
-    compaction boundary (#33618). Copy the goal onto the new session and archive the old row as ``cleared``
-    so exactly one active goal row exists per logical conversation (avoids the "two active goals" hazard of
-    a pure copy).
+    Best-effort and never raises — a refusal here must not block compression itself. Returns
+    True only when the goal row moved atomically; on any refusal the parent keeps its goal
+    (recoverable, and no automatic continuation runs on the rotated session id).
     """
-    if not old_session_id or not new_session_id or old_session_id == new_session_id:
-        return False
     try:
-        state = load_goal(old_session_id)
-        if state is None or state.status == "cleared":
+        parent = load_goal(old_session_id)
+        if parent is None or parent.status == "cleared":
             return False
-        # Don't clobber a goal already set on the child (e.g. a resumed lineage).
-        if load_goal(new_session_id) is not None:
-            return False
-        save_goal(new_session_id, state)
-        # Archive the parent's row so it isn't double-counted as active.
-        clear_goal(old_session_id)
-        logger.debug("GoalManager: migrated goal %s -> %s (%s)", old_session_id, new_session_id, reason or "rotation")
-        return True
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("GoalManager: goal migration failed: %s", exc)
+        moved = move_goal(old_session_id, new_session_id, GoalRef(parent.goal_id, parent.revision), reason=reason)
+        return moved is not None
+    except GoalStoreError as exc:
+        logger.warning(
+            "GoalManager: goal migration %s -> %s refused (%s: %s) — the goal stays on the parent "
+            "session and no automatic continuation runs on the child",
+            old_session_id, new_session_id, exc.kind, exc,
+        )
         return False
+
+
+# ── Admission (W2) ─────────────────────────────────────────────────────
+
+def goal_continuation_admitted(session_id: str) -> tuple[bool, str]:
+    """Layer 2 — may the /goal continuation queued for ``session_id`` start a turn right now?
+
+    Every surface calls this immediately before a synthetic continuation becomes a real turn:
+    the classic CLI's ``_pending_input`` drain, the gateway FIFO drain, the TUI follow-up
+    chain.  It re-reads the persisted goal and re-validates the ticket that was queued for it,
+    so a user pause / clear / edit that landed while the continuation sat in the queue stops it
+    before any model call or tool execution.  Enqueue is not admission.
+    """
+    try:
+        state = GoalManager(session_id).state
+    except Exception as exc:  # health: allow BLE001 -- fail-closed admission gate: any unreadable state (store down, corrupt row) refuses the turn rather than starting work on a guess
+        logger.debug("goal admission: state for %s unreadable: %s", session_id, exc)
+        return False, "goal state could not be read"
+    if state is None or not state.goal_id:
+        return False, "no goal is stored for this session"
+    return goal_admission.admit_queued(
+        state.goal_id, revision=state.revision, status=state.status)
 
 
 # ── Judge ─────────────────────────────────────────────────────────────
@@ -1086,7 +1274,7 @@ _JUDGE_CONFIG_HINT = (
 )
 
 
-class GoalManager:
+class GoalManager(GoalAuthorizationMixin):
     """Per-session goal state + continuation decisions.
 
     The CLI and gateway each hold one per live session. ``evaluate_after_turn`` calls the judge and
@@ -1097,13 +1285,31 @@ class GoalManager:
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
         self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
-        self._state: Optional[GoalState] = load_goal(session_id)
+        self._load_error: Optional[GoalStoreError] = None
+        try:
+            self._state: Optional[GoalState] = load_goal(session_id)
+        except GoalStoreError as exc:
+            # An unreadable row or an unreadable store is NOT "no goal": the goal is kept (bytes
+            # untouched) and reported, and nothing automatic may run on it.
+            self._state = None
+            self._load_error = exc
+            if exc.kind == "corrupt":
+                logger.warning("GoalManager: stored goal for %s is unreadable: %s", session_id, exc)
+            else:
+                # A bootstrap-window miss is expected degradation, not an operator problem.
+                logger.debug("GoalManager: goal for %s not loaded (%s): %s", session_id, exc.kind, exc)
 
     # --- introspection ------------------------------------------------
 
     @property
     def state(self) -> Optional[GoalState]:
         return self._state
+
+    @property
+    def load_error(self) -> Optional[GoalStoreError]:
+        """Why the persisted goal could not be loaded (unreadable row / unreadable store).
+        Set instead of silently degrading to "no goal" — the goal was NOT discarded."""
+        return self._load_error
 
     def is_active(self) -> bool:
         return self._state is not None and self._state.status == "active"
@@ -1116,7 +1322,13 @@ class GoalManager:
 
     def status_line(self) -> str:
         s = self._state
-        if s is None or s.status == "cleared":
+        if s is None:
+            if self._load_error is not None:
+                return (f"⚠ Goal state unreadable ({self._load_error.kind}) — the stored goal was NOT "
+                        f"discarded: {self._load_error} Fix the session store, or replace the goal "
+                        "with /goal <text>.")
+            return "No active goal. Set one with /goal <text>."
+        if s.status == "cleared":
             return "No active goal. Set one with /goal <text>."
         turns = f"{s.turns_used}/{s.max_turns} turns"
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
@@ -1143,8 +1355,31 @@ class GoalManager:
     # --- mutation -----------------------------------------------------
 
     def _save(self) -> Optional[GoalState]:
-        save_goal(self.session_id, self._state)
-        return self._state
+        """Commit the mutated in-memory snapshot through the CAS transaction.
+
+        The stored row must still be the one this manager read (``goal_id`` + ``revision``);
+        if the user paused, cleared or edited the goal while a judge was running, the commit is
+        refused, the stored snapshot is adopted in memory, and the GoalConflict propagates so no
+        caller can report a success that never landed.
+        """
+        state = self._state
+        if state is None:
+            return None
+        try:
+            return commit_goal(self.session_id, GoalRef(state.goal_id, state.revision), state)
+        except GoalConflict as conflict:
+            self._adopt_stored(conflict)
+            raise
+
+    def _adopt_stored(self, conflict: GoalConflict) -> None:
+        """After a refused write the stored row wins: drop our stale in-memory snapshot."""
+        if conflict.current is not None:
+            self._state = conflict.current
+            return
+        try:
+            self._state = load_goal(self.session_id)
+        except GoalStoreError:
+            self._state = None
 
     def _require_goal(self) -> GoalState:
         if self._state is None or not self.has_goal():
@@ -1159,6 +1394,9 @@ class GoalManager:
     def _pause_state(self, reason: str) -> None:
         self._state.status = "paused"
         self._state.paused_reason = reason
+        # Every pause is a stop: revoke the execution authorization and the queued ticket with
+        # it, before the commit, so a refused write can never leave an armed goal behind.
+        self._disarm()
         self._save()
 
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> dict[str, Any]:
@@ -1169,12 +1407,30 @@ class GoalManager:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
-        self._state = GoalState(
+        next_state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=time.time(), last_turn_at=0.0,
             max_turns=int(max_turns) if max_turns else self.default_max_turns,
             contract=contract if contract is not None else GoalContract(),
         )
-        return self._save()
+        try:
+            # A create-or-replace: guarded by the ref this manager holds (a goal another surface
+            # created meanwhile is a conflict) but always a NEW identity, so a cleared goal's
+            # tombstone or a replaced goal cannot be hit by an old reference.
+            committed = commit_goal(self.session_id, self._expected_ref(), next_state, new_goal=True)
+        except GoalConflict as conflict:
+            self._adopt_stored(conflict)
+            raise
+        replaced = self._state.goal_id if self._state is not None else ""
+        self._state = committed
+        if replaced and replaced != committed.goal_id:
+            goal_admission.disarm(replaced, reason="goal replaced")
+        self._arm_if_budget("user_set")
+        return committed
+
+    def _expected_ref(self) -> Optional[GoalRef]:
+        """The CAS handle of the goal this manager holds; ``None`` when it holds none."""
+        state = self._state
+        return None if state is None else GoalRef(state.goal_id, state.revision)
 
     def set_contract(self, contract: GoalContract) -> Optional[GoalState]:
         """Attach or replace the completion contract on the active goal."""
@@ -1189,6 +1445,8 @@ class GoalManager:
         self._state.status = "paused"
         self._state.paused_reason = reason
         self._state.clear_wait()   # a wait barrier is meaningless once paused
+        # A manual pause is a stop: revoke first so a refused commit cannot leave the goal armed.
+        self._disarm()
         return self._save()
 
     def resume(self, *, reset_budget: bool = True) -> Optional[GoalState]:
@@ -1199,13 +1457,25 @@ class GoalManager:
         self._state.clear_wait()   # resuming starts fresh
         if reset_budget:
             self._state.turns_used = 0
-        return self._save()
+        committed = self._save()
+        # An explicit resume re-authorizes this process, and mints a fresh owner epoch so every
+        # ticket issued under the previous authorization is stale from here on. The kickoff turn
+        # it queues is a continuation too, so it carries a ticket of its own.
+        self._arm_if_budget("user_resume")
+        self.issue_continuation_ticket("user_resume")
+        return committed
 
     def clear(self) -> None:
-        if self._state is None:
+        state = self._state
+        if state is None:
             return
-        self._state.status = "cleared"
-        self._save()
+        try:
+            commit_goal(self.session_id, GoalRef(state.goal_id, state.revision),
+                        replace(state, status="cleared"))
+        except GoalConflict as conflict:
+            self._adopt_stored(conflict)
+            raise
+        self._disarm()
         self._state = None
 
     def mark_done(self, reason: str) -> None:
@@ -1214,6 +1484,7 @@ class GoalManager:
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
+        self._disarm()
         self._save()
 
     # --- /subgoal user controls ---------------------------------------
@@ -1480,11 +1751,71 @@ class GoalManager:
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         background_processes: Optional[list[dict[str, Any]]] = None,
-        active_delegations: int = 0,
+        active_delegations: int = 0, round_id: str = "",
     ) -> dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
-        own continuations increment ``turns_used`` — both consume model budget."""
+        own continuations increment ``turns_used`` — both consume model budget.
+
+        A store failure is a DECISION, never an exception: the judge's verdict is discarded, no new
+        round starts, and the stored state wins — a pause/clear/edit that landed while the judge was
+        running must not be overwritten by the late result, and a broken store must not be reported
+        as a goal update (T01/T04).
+
+        ``round_id`` is the caller's identity for the round this turn belongs to. When supplied, a
+        repeated post-turn callback carrying the same id is refused here — before the gates, before
+        the judge — so one round costs one judge call and one turn of budget however many times the
+        hook fires.
+        """
+        state = self._state
+        if state is None or state.status != "active":
+            return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
+        if (refusal := self._authorization_gate()) is not None:
+            return refusal
+        if round_id and not goal_admission.claim_round(
+                state.goal_id, goal_admission.armed_epoch(state.goal_id) or "", round_id):
+            return _decision(
+                "active", False, None, "duplicate_round",
+                f"round {round_id} was already admitted",
+                f"↻ Skipped a duplicate continuation callback for round {round_id}.",
+            )
+        try:
+            return self._judge_turn(
+                last_response, background_processes=background_processes, active_delegations=active_delegations,
+                round_id=round_id,
+            )
+        except GoalStoreError as exc:
+            return self._store_failure_decision(exc)
+
+    def _store_failure_decision(self, exc: GoalStoreError) -> dict[str, Any]:
+        """Fail closed on a refused/failed commit: no round, no false success, stored state kept."""
+        status = self._state.status if self._state is not None else "active"
+        messages = {
+            "conflict": ("↻ Goal changed while judging (paused / cleared / edited) — the stale "
+                         "verdict was discarded. /goal status shows the current state."),
+            "corrupt": ("⚠ The stored goal is unreadable, so nothing was changed and no round "
+                        "started. The original row is preserved; /goal set replaces it."),
+            "unavailable": ("⚠ The goal state could not be saved (session store unavailable) — no "
+                            "round started. The in-memory goal stays active until the store returns."),
+        }
+        verdict = {"conflict": "state_changed", "corrupt": "state_corrupt"}.get(exc.kind, "state_write_failed")
+        return _decision(status, False, None, verdict, str(exc), messages.get(exc.kind, str(exc)))
+
+    def _judge_turn(
+        self, last_response: str, *,
+        background_processes: Optional[list[dict[str, Any]]] = None,
+        active_delegations: int = 0, round_id: str = "",
+    ) -> dict[str, Any]:
+        decision = self._run_judge(
+            last_response, background_processes=background_processes, active_delegations=active_delegations,
+        )
+        return self._ticket_continuation(decision, round_id)
+
+    def _run_judge(
+        self, last_response: str, *,
+        background_processes: Optional[list[dict[str, Any]]] = None,
+        active_delegations: int = 0,
+    ) -> dict[str, Any]:
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
@@ -1585,169 +1916,6 @@ class GoalManager:
             "(no completion contract — set one with /goal draft <objective> or inline field: value lines)")
 
 
-# ── Kanban worker goal loop ───────────────────────────────────────────
-
-# Fed to a kanban goal-mode worker that hasn't completed/blocked its task yet: short, and points it
-# back at the lifecycle contract (it already has the full task body).
-KANBAN_GOAL_CONTINUATION_TEMPLATE = (
-    "[Continuing toward this kanban task — judge says it is not done yet]\n"
-    "Reason: {reason}\n\n"
-    "Take the next concrete step toward completing the task. When the work "
-    "is genuinely finished, call kanban_complete with a summary. If it is a "
-    "code change that needs same-card review before counting as done, call "
-    "kanban_request_review with a summary instead. If you are blocked and "
-    "need human input, call kanban_block with a reason. Do not stop without "
-    "calling one of them."
-)
-
-# Judge says done but the worker never made a terminal board call
-# (kanban_complete/kanban_request_review/kanban_block): one explicit nudge.
-KANBAN_GOAL_FINALIZE_TEMPLATE = (
-    "[The work looks complete, but the task is still open]\n"
-    "Reason: {reason}\n\n"
-    "If the task is genuinely done, call kanban_complete now with a short "
-    "summary of what you did. If it is a code change awaiting same-card review, "
-    "call kanban_request_review with that summary instead. If something still "
-    "blocks completion, call kanban_block with the reason instead."
-)
-
-
-# Worker-driven terminal task statuses → loop outcome. The card's own acceptance criteria are the
-# goal; the worker already has the full task body, so these outcomes stop the loop cleanly.
-_KANBAN_TERMINAL_STATUSES = {
-    "done": ("completed_by_worker", "worker completed the task", "task {task_id} completed by worker after {turns} turn(s)"),
-    "blocked": ("blocked_by_worker", "worker blocked the task", "task {task_id} blocked by worker after {turns} turn(s)"),
-    # kanban_request_review is a legitimate terminator: implementation done, awaiting a reviewer.
-    "review": ("review_requested_by_worker", "worker requested review", "task {task_id} handed off for review by worker after {turns} turn(s)"),
-    "changes_requested": ("changes_requested_by_reviewer", "reviewer requested changes", "reviewer returned task {task_id} for changes after {turns} turn(s)"),
-}
-
-
-def run_kanban_goal_loop(
-    *,
-    task_id: str,
-    goal_text: str,
-    run_turn,
-    task_status_fn,
-    block_fn,
-    max_turns: int = DEFAULT_MAX_TURNS,
-    first_response: str = "",
-    log=None,
-) -> dict[str, Any]:
-    """Drive a kanban worker through a Ralph-style goal loop.
-
-    Each iteration: stop if the worker already terminated the task (``kanban_complete`` /
-    ``kanban_block`` / review hand-off); otherwise judge the latest response against ``goal_text``
-    (the card's title + body) and feed a continuation or finalize nudge. A WAIT verdict is treated
-    as CONTINUE (workers finish via kanban tools, not by parking).
-    """
-
-    def _log(msg: str) -> None:
-        if log is not None:
-            try:
-                log(msg)
-            except Exception:
-                pass
-
-    def _block(message: str) -> None:
-        try:
-            block_fn(message)
-        except Exception as exc:
-            _log(f"kanban goal loop: block_fn failed ({exc})")
-
-    def _result(outcome: str, reason: str) -> dict[str, Any]:
-        return {"outcome": outcome, "turns_used": turns_used, "reason": reason}
-
-    max_turns = int(max_turns or DEFAULT_MAX_TURNS)
-    if max_turns < 1:
-        max_turns = DEFAULT_MAX_TURNS
-
-    last_response = first_response or ""
-    turns_used = 1   # the first turn already consumed one unit of budget
-    nudged_to_finalize = False
-
-    while True:
-        try:
-            status = task_status_fn()
-        except Exception as exc:
-            _log(f"kanban goal loop: status check failed ({exc}); stopping")
-            return _result("stopped", "status check failed")
-
-        terminal = _KANBAN_TERMINAL_STATUSES.get(status)
-        if terminal is not None:
-            outcome, reason, log_fmt = terminal
-            _log("kanban goal loop: " + log_fmt.format(task_id=task_id, turns=turns_used))
-            return _result(outcome, reason)
-        if status not in ("running", "ready"):
-            # Reclaimed / archived / unexpected — let the dispatcher own it.
-            _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
-            return _result("stopped", f"status={status}")
-
-        from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
-        affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
-        try:
-            verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
-        finally:
-            if affinity_token is not None:
-                reset_affinity_scope(affinity_token)
-        if _transport_failed:
-            _log(f"kanban goal loop: judge transport failed on turn {turns_used}; stopping")
-            return _result("stopped", "judge transport failure")
-        if verdict == "wait":
-            verdict = "continue"
-        _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
-
-        if verdict == "blocked":
-            # Unachievable is NOT done: block the card with the judge's reason now instead of
-            # re-poking an impossible goal, and never let it land in done.
-            # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
-            _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
-            _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
-            return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
-
-        if verdict == "done":
-            if nudged_to_finalize:
-                # Already asked once to call kanban_complete — block for review rather than spin.
-                _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
-                _block(
-                    f"Goal-mode worker's output looked complete but it never "
-                    f"called kanban_complete after a finalize nudge ({reason})."
-                )
-                return _result("blocked_budget", "judged done, never finalized")
-            prompt = KANBAN_GOAL_FINALIZE_TEMPLATE.format(reason=_truncate(reason, 400))
-            nudged_to_finalize = True
-        else:
-            prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
-
-        # Budget check BEFORE spending another turn.
-        if turns_used >= max_turns:
-            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            _block(
-                f"Goal-mode worker exhausted its turn budget "
-                f"({turns_used}/{max_turns}) without completing the task. "
-                f"Last judge verdict: {_truncate(reason, 300)}"
-            )
-            return _result("blocked_budget", "turn budget exhausted")
-
-        try:
-            result = run_turn(prompt)
-            if isinstance(result, dict):
-                last_response = result.get("response", "") or ""
-                failed = bool(result.get("failed", False))
-                failure_reason = result.get("failure_reason") or "unknown"
-            else:
-                # backward compatibility: assume it's a string
-                last_response = result or ""
-                failed = False
-                failure_reason = None
-        except Exception as exc:
-            _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
-            return _result("stopped", f"run_turn error: {type(exc).__name__}")
-        if failed:
-            _log(f"kanban goal loop: worker failed on turn {turns_used} (reason={failure_reason}); stopping")
-            return _result("stopped", f"worker failed: {failure_reason}")
-        turns_used += 1
-
 
 __all__ = [
     "CONTINUATION_PROMPT_TEMPLATE",
@@ -1755,20 +1923,29 @@ __all__ = [
     "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "DEFAULT_MAX_TURNS",
     "DRAFT_CONTRACT_SYSTEM_PROMPT",
+    "GOAL_STATE_SCHEMA_VERSION",
     "JUDGE_USER_PROMPT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
     "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "GoalConflict",
     "GoalContract",
     "GoalGate",
     "GoalManager",
+    "GoalRef",
     "GoalState",
+    "GoalStateCorrupt",
+    "GoalStoreError",
+    "GoalStoreUnavailable",
     "clear_goal",
+    "commit_goal",
     "draft_contract",
+    "goal_continuation_admitted",
     "judge_goal",
     "load_goal",
     "migrate_goal_to_session",
+    "move_goal",
     "parse_contract",
     "run_gate",
     "run_kanban_goal_loop",
