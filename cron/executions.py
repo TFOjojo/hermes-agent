@@ -30,7 +30,16 @@ logger = logging.getLogger(__name__)
 # that temporarily enter another profile cannot leak that profile's records into the import-time
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# Keep enough terminal rows for a week of family-wide auditing. 1,000 rows only
+# covered ~9 hours on this machine because several jobs run every 3-5 minutes.
+# Override with HERMES_CRON_MAX_TERMINAL_EXECUTIONS for a bounded window.
+_DEFAULT_MAX_TERMINAL_EXECUTIONS = 25000
+try:
+    MAX_TERMINAL_EXECUTIONS = max(
+        1000, int(os.environ.get("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", _DEFAULT_MAX_TERMINAL_EXECUTIONS))
+    )
+except (TypeError, ValueError):
+    MAX_TERMINAL_EXECUTIONS = _DEFAULT_MAX_TERMINAL_EXECUTIONS
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
