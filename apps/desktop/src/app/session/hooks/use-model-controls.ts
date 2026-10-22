@@ -455,7 +455,12 @@ export function useModelControls({
         // The canonical owner explicitly refused admission: this is NOT a queued
         // switch. Restore the real selection and let the user re-pick after idle.
         if ((err as { data?: { reason?: string } } | null)?.data?.reason === 'session_busy') {
-          rollbackSelection()
+          const restored = settleUnapplied()
+
+          if (restored) {
+            restoreSnapshot(restored)
+          }
+
           notifyError(new Error(copy.modelSwitchBusy ?? copy.sessionBusy), copy.modelSwitchFailed)
 
           return false

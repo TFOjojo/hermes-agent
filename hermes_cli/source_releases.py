@@ -126,7 +126,7 @@ def _probe(git_cmd, cwd, *args):
         return subprocess.run(
             [*git_cmd, *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=10, stdin=subprocess.DEVNULL, env=source_git_env(),
-            check=False)
+            check=False, **_hidden_kwargs())
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("git %s did not answer: %s", " ".join(args), exc)
         return None
@@ -143,6 +143,7 @@ def _head_containing(git_cmd, cwd, commit: str, repository: str) -> str | None:
     head = subprocess.run(
         [*git_cmd, "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True, encoding="utf-8",
         errors="replace", timeout=10, stdin=subprocess.DEVNULL, env=source_git_env(), check=False,
+        **_hidden_kwargs(),
     ).stdout.strip()
     if not _SHA.fullmatch(head):
         return None

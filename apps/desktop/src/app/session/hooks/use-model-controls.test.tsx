@@ -53,8 +53,6 @@ vi.mock('@/i18n', async importOriginal => ({
       desktop: {
         modelSwitchFailed: 'Model switch failed',
         modelSwitchBusy: 'The current reply is still running. The model was not changed; try again when it finishes.'
-      }
-        modelSwitchFailed: 'Model switch failed'
       },
       shell: { modelMenu: { pickDeferred: (model: string) => `${model} applies from your next message` } }
     }

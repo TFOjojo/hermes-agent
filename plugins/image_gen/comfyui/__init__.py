@@ -45,6 +45,14 @@ _POLL_TIMEOUT = 600.0
 
 
 def _hermes_home() -> Path:
+    # Canonical resolver first: the install home is D:\...\AI\hermes, not ~/.hermes, so a bare
+    # env-or-home fallback silently points generation at the retired 8188 default.
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home()
+    except Exception:  # pragma: no cover - resolution must never break gen
+        pass
     env = os.environ.get("HERMES_HOME")
     if env:
         return Path(env)
@@ -81,9 +89,9 @@ class ComfyUIImageGenProvider(ImageGenProvider):
         except Exception:
             return False
 
-    def list_models(self) -> List[Dict[str, Any]]:
+    def list_models(self) -> list[dict[str, Any]]:
         base = _comfy_base()
-        models: List[str] = []
+        models: list[str] = []
         try:
             with urllib.request.urlopen(base + "/object_info/CheckpointLoaderSimple", timeout=5) as r:
                 data = json.loads(r.read().decode("utf-8"))
@@ -99,7 +107,7 @@ class ComfyUIImageGenProvider(ImageGenProvider):
         except Exception as exc:
             logger.debug("UNETLoader object_info failed: %s", exc)
         seen: set[str] = set()
-        out: List[Dict[str, Any]] = []
+        out: list[dict[str, Any]] = []
         for m in models:
             if m not in seen:
                 seen.add(m)
@@ -119,7 +127,7 @@ class ComfyUIImageGenProvider(ImageGenProvider):
         models = self.list_models()
         return models[0].get("id") if models else None
 
-    def capabilities(self) -> Dict[str, Any]:
+    def capabilities(self) -> dict[str, Any]:
         return {"modalities": ["text"], "max_reference_images": 0}
 
     def generate(
@@ -128,9 +136,9 @@ class ComfyUIImageGenProvider(ImageGenProvider):
         aspect_ratio: str = DEFAULT_ASPECT_RATIO,
         *,
         image_url: Optional[str] = None,
-        reference_image_urls: Optional[List[str]] = None,
+        reference_image_urls: Optional[list[str]] = None,
         **kwargs: Any,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         base = _comfy_base()
         aspect = resolve_aspect_ratio(aspect_ratio)
         model = kwargs.get("model") or self.default_model() or "flux1-dev-fp8.safetensors"
@@ -186,7 +194,7 @@ class ComfyUIImageGenProvider(ImageGenProvider):
 
     @staticmethod
     def _build_workflow(model: str, prompt: str, width: int, height: int,
-                        steps: int, cfg: float) -> Dict[str, Any]:
+                        steps: int, cfg: float) -> dict[str, Any]:
         lower = model.lower()
         if "flux" in lower:
             return {
@@ -228,7 +236,7 @@ class ComfyUIImageGenProvider(ImageGenProvider):
         }
 
     @staticmethod
-    def _submit(base: str, workflow: Dict[str, Any]) -> str:
+    def _submit(base: str, workflow: dict[str, Any]) -> str:
         body = json.dumps({"prompt": workflow, "client_id": "hermes-image-gen"}).encode("utf-8")
         req = urllib.request.Request(
             base + "/prompt", data=body,

@@ -260,8 +260,8 @@ export class CanonicalDesktopProtocol {
     // alone, so keeping the refused request would resend it for every later /undo instead of deriving.
     if (typeof reason === 'string' && params.operation === 'rewind') { this.forgetMutation(params) }
 
-    // A typed busy refusal of a rewind or a move wrote nothing either; the retry is a new request at the new revision.
-    if (reason !== 'revision_conflict' && reason !== 'stale_generation' && !(reason === 'session_busy' && ['rewind', 'workspace'].includes(params.operation as string))) { return }
+    // A typed busy refusal wrote nothing; a model re-pick, rewind or move is a new intent at the latest revision.
+    if (reason !== 'revision_conflict' && reason !== 'stale_generation' && !(reason === 'session_busy' && ['model', 'rewind', 'workspace'].includes(params.operation as string))) { return }
 
     // A confirmed fence refusal did not mutate. Ambiguous transport failures keep
     // the original revision/id so a retry cannot overwrite another user's edit.
