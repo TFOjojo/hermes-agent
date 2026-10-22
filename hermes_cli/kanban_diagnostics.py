@@ -807,6 +807,103 @@ def _rule_stale_running(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _age_label(age_seconds: float) -> str:
+    if age_seconds >= 3600:
+        return f"{age_seconds / 3600:.1f}h"
+    return f"{int(age_seconds / 60)}m"
+
+
+def _active_occupancy_blocker(cfg: dict):
+    """The card currently holding the repository scope this one needs, if any.
+
+    The dispatcher defers an overlapping card without recording a reason, so an operator
+    sees a ready card that simply never starts. This resumes the missing why.
+    """
+    graph = cfg.get("_graph") or {}
+    blocker = graph.get("occupancy_blocker") if isinstance(graph, dict) else None
+    if not isinstance(blocker, dict):
+        return None
+    if blocker.get("status") not in {"running", "review"}:
+        return None
+    return blocker
+
+
+def _rule_waiting_on_occupancy(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """A ready/review card intentionally parked behind an overlapping repository scope."""
+    if _task_field(task, "status") not in {"ready", "review"}:
+        return []
+    blocker = _active_occupancy_blocker(cfg)
+    if blocker is None:
+        return []
+    blocker_id = str(blocker.get("id") or "unknown")
+    title = str(blocker.get("title") or blocker_id)
+    return [Diagnostic(
+        kind="waiting_on_occupancy",
+        severity="warning",
+        title=f"Waiting for repository occupancy: {blocker_id}",
+        detail=(
+            f"This task is intentionally waiting while {title!r} occupies "
+            "an overlapping repository scope. Reassignment is not required."
+        ),
+        actions=[],
+        first_seen_at=int(now),
+        last_seen_at=int(now),
+        count=1,
+        data={
+            "blocker_task_id": blocker_id,
+            "blocker_title": title,
+            "overlap_keys": list(blocker.get("overlap_keys") or []),
+        },
+    )]
+
+
+def _rule_review_backlog(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Implementation waiting in review past the operator threshold.
+
+    Review is where a handoff must be inspected: a DSH exit 0 is not acceptance, so a card
+    parked here for an hour is a decision nobody made, not progress.
+    """
+    if _task_field(task, "status") != "review":
+        return []
+    if _active_occupancy_blocker(cfg) is not None:
+        return []
+    threshold = float(cfg.get("review_backlog_seconds", 30 * 60))
+    last_review = 0
+    for ev in events:
+        if _event_kind(ev) in {"review_requested", "request_review"}:
+            last_review = max(last_review, _event_ts(ev))
+    if last_review <= 0:
+        last_review = int(_task_field(task, "updated_at", 0) or 0) or int(
+            _task_field(task, "started_at", 0) or 0
+        )
+    if last_review <= 0:
+        return []
+    age = now - last_review
+    if age < threshold:
+        return []
+    age_str = _age_label(age)
+    severity = "warning" if age < threshold * 3 else "error"
+    return [Diagnostic(
+        kind="review_backlog",
+        severity=severity,
+        title=f"Review waiting {age_str}",
+        detail=(
+            f"Task {_task_field(task, 'id')} has been in review for {age_str}. "
+            f"Hermes must inspect the handoff; DSH exit 0 is not acceptance."
+        ),
+        actions=[
+            _cli_hint("Show the task", f"hermes kanban show {_task_field(task, 'id')}",
+                      suggested=True),
+        ],
+        first_seen_at=last_review,
+        last_seen_at=now,
+        data={
+            "age_seconds": int(age),
+            "assignee": _task_field(task, "assignee"),
+        },
+    )]
+
+
 # Order matters: earlier rules render first on severity ties.
 _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
@@ -820,6 +917,8 @@ _RULES: list[RuleFn] = [
     _rule_block_unblock_cycling,
     _rule_stranded_in_ready,
     _rule_stale_running,
+    _rule_waiting_on_occupancy,
+    _rule_review_backlog,
 ]
 
 
@@ -838,6 +937,9 @@ DEFAULT_CONFIG = {
     # still `running` an hour past its expiry means every reclaim path declined
     # it. Same hour the heartbeat backstop uses.
     "stale_running_grace_seconds": 60 * 60,
+    # Review is where the handoff must be inspected; an hour parked there is a
+    # decision nobody made.
+    "review_backlog_seconds": 30 * 60,
 }
 
 

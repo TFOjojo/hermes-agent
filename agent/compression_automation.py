@@ -8,8 +8,10 @@ def carry_compression_automation(agent, old_session_id):
         return
     from agent.conversation_compression import _swallow
     with _swallow('Could not migrate goal on compression: %s'):
-        from hermes_cli.goals import migrate_goal_to_session
-        migrate_goal_to_session(old_session_id, agent.session_id, reason='compression')
+        # A refused transfer must not be silent: the goal stays on the parent
+        # session, so the user is told instead of watching it disappear (W2).
+        from agent.conversation_compression_goal_carry import carry_goal_to_child
+        carry_goal_to_child(agent, old_session_id)
     with _swallow('Could not migrate heartbeat on compression: %s'):
         from hermes_cli.heartbeat import migrate_heartbeat_to_session
         migrate_heartbeat_to_session(old_session_id, agent.session_id)

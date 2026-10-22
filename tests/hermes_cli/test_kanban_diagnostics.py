@@ -221,3 +221,61 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# flow observability — occupancy wait + review backlog
+# ---------------------------------------------------------------------------
+
+
+def test_waiting_on_occupancy_explains_ready_wait():
+    now = 100_000
+    task = _task(status="ready", assignee="workhorse")
+    graph = {"parents": [], "children": [], "occupancy_blocker": {
+        "id": "t_writer", "title": "active writer", "status": "running",
+        "overlap_keys": ["repo:d:/work/repo"],
+    }}
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, graph=graph)
+    waiting = [d for d in diags if d.kind == "waiting_on_occupancy"]
+    assert len(waiting) == 1
+    assert waiting[0].data["blocker_task_id"] == "t_writer"
+    assert waiting[0].data["overlap_keys"] == ["repo:d:/work/repo"]
+    plain = kd.compute_task_diagnostics(task, [], [], now=now)
+    assert [d for d in plain if d.kind == "waiting_on_occupancy"] == []
+
+
+def test_waiting_on_occupancy_ignores_finished_blocker():
+    now = 100_000
+    task = _task(status="ready")
+    graph = {"parents": [], "children": [], "occupancy_blocker": {
+        "id": "t_writer", "title": "done writer", "status": "done",
+    }}
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, graph=graph)
+    assert [d for d in diags if d.kind == "waiting_on_occupancy"] == []
+
+
+def test_review_backlog_fires_past_threshold():
+    now = 200_000
+    task = _task(status="review", updated_at=now - 60 * 60)
+    diags = kd.compute_task_diagnostics(task, [], [], now=now)
+    backlog = [d for d in diags if d.kind == "review_backlog"]
+    assert len(backlog) == 1
+    assert backlog[0].severity == "warning"
+    assert backlog[0].data["age_seconds"] == 60 * 60
+    fresh = _task(status="review", updated_at=now - 60)
+    assert [d for d in kd.compute_task_diagnostics(fresh, [], [], now=now)
+            if d.kind == "review_backlog"] == []
+
+
+def test_review_backlog_escalates_and_yields_to_occupancy():
+    now = 900_000
+    stale = _task(status="review", updated_at=now - 3 * 3600)
+    diags = kd.compute_task_diagnostics(stale, [], [], now=now)
+    backlog = [d for d in diags if d.kind == "review_backlog"]
+    assert backlog[0].severity == "error"
+    graph = {"parents": [], "children": [], "occupancy_blocker": {
+        "id": "t_writer", "title": "active writer", "status": "running",
+    }}
+    blocked = kd.compute_task_diagnostics(stale, [], [], now=now, graph=graph)
+    assert [d for d in blocked if d.kind == "review_backlog"] == []
+    assert [d for d in blocked if d.kind == "waiting_on_occupancy"] != []
