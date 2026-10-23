@@ -12,6 +12,7 @@ import contextlib
 import functools
 import json
 import logging
+import os
 import shutil
 from datetime import datetime, timezone, UTC
 from pathlib import Path
@@ -44,6 +45,13 @@ def is_safe_path(path: Path) -> bool:
         return True
     except ValueError:
         pass
+
+    # Windows has no POSIX /tmp: ``Path("/tmp")`` resolves to ``<current drive>:\tmp``,
+    # which is an ordinary user directory, not disposable scratch. Without this guard
+    # every ``D:\tmp\hermes-<x>`` working tree had its ``test_*.py`` files deleted the
+    # moment they were tracked (age >= 0), destroying in-progress evidence.
+    if os.name == "nt":
+        return False
 
     # Allow /tmp/hermes-* explicitly. Compare resolved roots rather than raw
     # path parts because macOS resolves /tmp to /private/tmp.
