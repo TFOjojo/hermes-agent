@@ -6711,11 +6711,15 @@ def _define_discord_view_classes() -> None:
                 for i in range(0, len(models), _DISCORD_SELECT_MAX_OPTIONS)
             ][: _DISCORD_SELECT_MAX_ROWS - 2]
             placeholder_base = t("platform.discord.picker.model_placeholder", provider=provider.get("name", provider_slug))
+            from hermes_cli.model_picker_usage import picker_row_suffix
             for idx, chunk in enumerate(chunks):
                 options = [
                     discord.SelectOption(
                         label=_truncate_discord_component_text(model_id.split("/")[-1], _DISCORD_SELECT_FIELD_LIMIT),
-                        value=self._model_option_value(idx, slot, model_id),
+                            value=self._model_option_value(idx, slot, model_id),
+                            # Usage-window plans: "Large" / "Free" (empty for every other account).
+                            description=(_truncate_discord_component_text(suffix, _DISCORD_SELECT_FIELD_LIMIT)
+                                         if (suffix := picker_row_suffix(provider, model_id)) else None),
                     )
                     for slot, model_id in enumerate(chunk)
                 ]
@@ -6759,7 +6763,9 @@ def _define_discord_view_classes() -> None:
             total = provider.get("total_models", 0) if provider else 0
             shown = min(len(provider.get("models", [])), _DISCORD_MODEL_SELECT_CAPACITY) if provider else 0
             extra = f"\n*{t('platform.discord.picker.more_available', count=str(total - shown))}*" if total > shown else ""
-            await self._edit(interaction, t("platform.discord.picker.select_model", provider=pname, extra=extra))
+            # Window plans: the limit line leads the message (absent for every other account).
+            plan_line = f"⚠️ {provider['plan_line']}\n" if provider and provider.get("plan_line") else ""
+            await self._edit(interaction, plan_line + t("platform.discord.picker.select_model", provider=pname, extra=extra))
 
         def _build_reasoning_select(self, model_id: str):
             self.clear_items()
