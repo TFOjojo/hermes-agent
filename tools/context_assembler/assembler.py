@@ -382,26 +382,87 @@ def _parse_lifeline_payload(payload: str) -> str:
     return payload.strip()
 
 
-def _active_scope_search(query: str):
-    """Use an already-loaded Scope Recall runtime. Never construct a second one."""
+def _providers_from_module(module) -> list:
+    """Collect live provider instances a module exposes.
+
+    Scope Recall publishes ``_PROVIDER_REGISTRY`` as a ``weakref.WeakSet``, not a
+    dict, so a dict-only check silently finds nothing and the recall path degrades
+    to "provider not loaded in this process".
+    """
+    found: list = []
+    registry = getattr(module, "_PROVIDER_REGISTRY", None)
+    if isinstance(registry, dict):
+        found.extend(registry.values())
+    elif registry is not None:
+        try:
+            found.extend([item for item in registry if item is not None])
+        except TypeError:
+            pass
+    provider = getattr(module, "provider", None)
+    if provider is not None:
+        found.append(provider)
+    return found
+
+
+def _live_scope_provider_containers():
+    """Yield already-imported modules that may expose a live Scope Recall provider.
+
+    User-installed providers are imported as
+    ``_hermes_user_memory.<name>__source_<digest>`` (see plugins/memory _module_name),
+    so probing exact names such as ``_hermes_user_memory.scope-recall.provider``
+    can never match. Probe the explicit names first, then match by namespace suffix.
+    """
     names = (
         "_hermes_user_memory.scope-recall.provider",
         "_hermes_user_memory.scope_recall.provider",
         "_hermes_user_memory.scope-recall",
         "_hermes_user_memory.scope_recall",
     )
-    seen: set[int] = set()
-    candidates = []
     for name in names:
         module = sys.modules.get(name)
-        if module is None:
+        if module is not None:
+            yield module
+    for name, module in list(sys.modules.items()):
+        if not name.startswith(("_hermes_user_memory.", "plugins.memory.")):
             continue
-        registry = getattr(module, "_PROVIDER_REGISTRY", None)
-        if isinstance(registry, dict):
-            candidates.extend(registry.values())
-        provider = getattr(module, "provider", None)
-        if provider is not None:
-            candidates.append(provider)
+        lowered = name.lower()
+        if "scope" in lowered and "recall" in lowered:
+            yield module
+
+
+def _scope_provider_modules():
+    """Backwards-compatible alias for the container probe."""
+    return _live_scope_provider_containers()
+
+
+def _scope_serves_prefetch() -> bool:
+    """True when Scope Recall's recall arrives through ``prefetch()``, not ``search_memories()``.
+
+    ``agent.memory_provider.MemoryProvider`` exposes ``prefetch`` and has never carried
+    ``search_memories``; the provider package itself exports only ``register`` /
+    ``register_adapter``, so no instance is reachable from the module namespace. The
+    host injects the prefetch envelope into the turn, so this channel has nothing to
+    fetch — but reporting that as "provider not loaded" made working memory look broken.
+    """
+    if next(_live_scope_provider_containers(), None) is None:
+        return False
+    try:
+        from agent.memory_provider import MemoryProvider
+    except Exception:  # pragma: no cover - interface import is best effort
+        return False
+    return callable(getattr(MemoryProvider, "prefetch", None))
+
+
+def _active_scope_search(query: str):
+    """Use an already-loaded Scope Recall runtime. Never construct a second one."""
+    seen_mods: set[int] = set()
+    candidates = []
+    for module in _scope_provider_modules():
+        if id(module) in seen_mods:
+            continue
+        seen_mods.add(id(module))
+        candidates.extend(_providers_from_module(module))
+    seen: set[int] = set()
     for cand in candidates:
         ident = id(cand)
         if ident in seen:
@@ -433,6 +494,11 @@ def _read_durable_memory(
         degraded.append({"source": "durable_memory", "reason": f"provider unavailable: {exc}"})
         return evidence, degraded
     if results is None:
+        if _scope_serves_prefetch():
+            # The provider recalls through its own prefetch() and the host injects that
+            # envelope into the turn; this channel has nothing to add and is NOT degraded.
+            logger.debug("durable_memory: supplied by the provider's prefetch channel")
+            return evidence, degraded
         degraded.append(
             {
                 "source": "durable_memory",
